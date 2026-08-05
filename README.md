@@ -856,8 +856,8 @@ plan. Bundles the backend marks `is_active: false` are dropped from every list, 
 | `ESIM_API_BASE_URL` | – | Required. Backend base URL **without** `/api/v1`. https in production |
 | `ESIM_MCP_ENVIRONMENT` | `local` | `local`, `development`, `qa`, `staging`, `production` |
 | `ESIM_MCP_TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
-| `ESIM_MCP_HOST` | `127.0.0.1` | HTTP transport bind host |
-| `ESIM_MCP_PORT` | `8080` | HTTP transport bind port |
+| `ESIM_MCP_HOST` | `127.0.0.1` | HTTP transport bind host. `0.0.0.0` when deployed |
+| `ESIM_MCP_PORT` | `8080` | HTTP transport bind port. Falls back to a platform `PORT` |
 | `ESIM_MCP_DEVICE_ID_SALT` | – | Required in production, >= 32 chars. Ephemeral outside production |
 | `ESIM_MCP_DEFAULT_LOCALE` | `en` | Sent as `Accept-Language` |
 | `ESIM_MCP_DEFAULT_CURRENCY` | `USD` | Sent as `X-Currency` |
@@ -872,8 +872,15 @@ plan. Bundles the backend marks `is_active: false` are dropped from every list, 
 | `ESIM_MCP_LOG_LEVEL` | `INFO` | `DEBUG`…`CRITICAL` |
 | `ESIM_MCP_DEV_CLIENT_ID` | `local-dev-client` | stdio/dev identity; ignored in production |
 
-Only these prefixed names are read. A platform-provided `PORT`, `HOST`, `ENVIRONMENT` or
-`LOG_LEVEL` is deliberately ignored so it cannot silently reconfigure the server.
+Only these prefixed names are read by the settings model, so a platform-provided `HOST`,
+`ENVIRONMENT` or `LOG_LEVEL` cannot silently reconfigure the server.
+
+The one deliberate exception is the listening port, and it lives in the HTTP entry point
+(`esim_mcp/http_app.py`) rather than in the settings model: `ESIM_MCP_PORT` > a
+platform-supplied `PORT` (Render, Heroku, Cloud Run) > the `8080` default. A hosted service
+has to listen where its platform routes, the port is not a security decision, and the
+precedence keeps an explicit setting of your own on top. A `PORT` that is not a valid port
+number aborts startup rather than falling back.
 
 The QA URL belongs in your local, git-ignored `.env` — never in committed source.
 `.env.example` contains placeholders only. Tests never read a `.env`.
@@ -921,7 +928,8 @@ esim-mcp
 
 ```bash
 ESIM_MCP_TRANSPORT=streamable-http ESIM_MCP_PORT=8080 python -m esim_mcp.server
-# endpoint: http://127.0.0.1:8080/mcp
+# MCP endpoint: http://127.0.0.1:8080/mcp
+# health:       http://127.0.0.1:8080/health
 ```
 
 Docker:
@@ -930,6 +938,80 @@ Docker:
 docker build -t esim-mcp .
 docker run --rm -p 8080:8080 --env-file .env esim-mcp
 ```
+
+---
+
+## Deploying over Streamable HTTP (Render and friends)
+
+`src/esim_mcp/http_app.py` is the deployed entry point. `create_app()` builds the ASGI
+application around the *same* `MCPServer` the stdio entry point uses and serves exactly two
+routes:
+
+| Route | Purpose |
+| --- | --- |
+| `POST /mcp` | Streamable HTTP MCP endpoint. The remote server URL a client is given **is** this URL |
+| `GET /health` | Liveness for the platform's health check. No backend call, no session state |
+
+Nothing else is mounted. In particular there is no `/register` and no
+`/.well-known/oauth-*`: the SDK publishes those only when an OAuth `AuthSettings` and token
+verifier are configured, and none is (see *Security model*). A client that probes them gets
+a 404, which is the honest answer from a server that cannot issue or verify tokens — a stub
+there would advertise an authorization server that does not exist.
+
+**Build command**
+
+```bash
+pip install --upgrade pip && pip install .
+```
+
+`requirements.txt` is the legacy FastAPI skeleton's dependency list and does **not**
+install this server. `pip install .` installs `esim_mcp` and its real dependencies from
+`pyproject.toml`.
+
+**Start command**
+
+```bash
+uvicorn esim_mcp.http_app:create_app --factory --host 0.0.0.0 --port $PORT
+```
+
+`python -m esim_mcp.server` with `ESIM_MCP_TRANSPORT=streamable-http` is equivalent: it
+serves the same app and resolves the same host and port.
+
+**Environment**
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `ESIM_API_BASE_URL` | your backend base URL, no `/api/v1` | required |
+| `ESIM_MCP_ENVIRONMENT` | `qa` | keeps the explicit QA/dev identity available. `production` fails closed without an OAuth token verifier — see below |
+| `ESIM_MCP_TRANSPORT` | `streamable-http` | |
+| `ESIM_MCP_HOST` | `0.0.0.0` | listen on the platform's interface, and drop the SDK's loopback-only `Host` allow-list (kept, it answers 421 to every request arriving through the platform's proxy) |
+| `ESIM_MCP_DEVICE_ID_SALT` | a long random value | keeps device ids stable across restarts |
+| `ESIM_MCP_LOG_LEVEL` | `INFO` | |
+
+The port comes from the platform's own `PORT`. `ESIM_MCP_PORT` still wins when it is set —
+set it only if you mean to override the platform.
+
+**Verify a deployment**
+
+```bash
+curl -sS https://<your-service>.onrender.com/health
+
+curl -sS -X POST https://<your-service>.onrender.com/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+```
+
+The second call must return `200` with the server's `initialize` result. A `404` means the
+platform is running something other than this app (the legacy `app.main:app` skeleton, for
+instance); a `421 Invalid Host header` means `ESIM_MCP_HOST` was left at its loopback
+default.
+
+> **Who the caller is.** Over Streamable HTTP without OAuth the transport has no verified
+> principal, so every caller of a deployed instance shares one server-side session and one
+> device id. That is acceptable for a single-tester QA URL and is exactly why
+> `ESIM_MCP_ENVIRONMENT=production` refuses to serve without a token verifier. Wiring the
+> verifier remains the prerequisite for a shared deployment — deploying is not that step.
 
 ---
 

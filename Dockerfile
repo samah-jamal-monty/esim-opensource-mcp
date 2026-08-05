@@ -20,10 +20,13 @@ USER esim
 
 # Configuration is supplied at runtime (ESIM_API_BASE_URL, ESIM_MCP_DEVICE_ID_SALT, ...).
 # No secrets are baked into the image.
+# ESIM_MCP_PORT is deliberately *not* baked in: the entry point then listens on the port a
+# platform hands it in PORT, and falls back to 8080 when nothing does.
 ENV ESIM_MCP_TRANSPORT=streamable-http \
-    ESIM_MCP_HOST=0.0.0.0 \
-    ESIM_MCP_PORT=8080
+    ESIM_MCP_HOST=0.0.0.0
 
 EXPOSE 8080
+
+# MCP endpoint: /mcp   health check: /health
 
 CMD ["python", "-m", "esim_mcp.server"]

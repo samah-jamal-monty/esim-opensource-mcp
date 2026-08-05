@@ -364,17 +364,17 @@ def main() -> None:
     """Console-script entry point."""
     settings = get_settings()
     configure_logging(settings.log_level)
-    components = build_components(settings)
 
     if settings.transport is Transport.STREAMABLE_HTTP:
-        components.server.run(
-            "streamable-http",
-            host=settings.host,
-            port=settings.port,
-            streamable_http_path="/mcp",
-        )
+        # Imported here: esim_mcp.http_app imports this module to build the components.
+        from esim_mcp.http_app import serve
+
+        # The deployed path goes through the same ASGI app a platform start command runs,
+        # so `python -m esim_mcp.server` and `uvicorn esim_mcp.http_app:create_app` serve
+        # exactly the same routes -- /mcp and /health -- on the same host and port.
+        serve(settings)
     else:
-        components.server.run("stdio")
+        build_components(settings).server.run("stdio")
 
 
 if __name__ == "__main__":  # pragma: no cover
