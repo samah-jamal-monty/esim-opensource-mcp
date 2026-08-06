@@ -20,6 +20,7 @@ regress:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable
@@ -363,6 +364,231 @@ def _quote_owner(quote_service: PurchaseQuoteService, quote_id: str) -> QuoteOwn
     """The stored quote's own owner, so a test never re-derives an owner key by hand."""
     stored = quote_service._store._quotes[quote_id]
     return QuoteOwner(session_key=stored.owner_session_key, user_ref=stored.owner_user_ref)
+
+
+# --------------------------------------------- the link reaches the user (QA regression)
+#
+# What went wrong in QA, end to end: the user picked a plan, chose Card, confirmed, and the
+# assistant answered "the platform didn't confirm whether the payment page was opened, so I
+# can't give you a link yet". The platform had in fact opened one -- the backend logged the
+# Stripe Checkout Session it created, and the Session existed, was `open` and carried a
+# usable url. What failed was this server's willingness to wait for the answer, and then its
+# account of what that meant.
+#
+# Two independent defects, one test group each:
+#
+#   1. the checkout POST ran on the 20s budget sized for single cached reads, while the
+#      platform's checkout endpoint makes six sequential third-party round trips. Hanging up
+#      does not stop the work -- it only discards the link;
+#   2. the result never said that the link *is* the outcome, so "no confirmation that a page
+#      opened" read like a reason to withhold it. There is no such confirmation to wait for.
+
+
+async def test_the_checkout_post_gets_its_own_wider_read_budget(
+    purchase_service: PurchasePreparationService,
+    card_service: CardPaymentService,
+    signed_in: Backend,
+    settings: Settings,
+) -> None:
+    """The one call that must not be abandoned early is the one that gets the longest wait."""
+    await open_checkout(purchase_service, card_service)
+
+    timeout = signed_in.checkout_calls[0].extensions["timeout"]
+    assert timeout["read"] == settings.checkout_read_timeout
+    assert settings.checkout_read_timeout > settings.read_timeout, (
+        "the checkout budget must exceed the one sized for single cached reads"
+    )
+
+
+async def test_a_slow_platform_still_yields_the_link_within_the_checkout_budget(
+    purchase_service: PurchasePreparationService,
+    card_service: CardPaymentService,
+    signed_in: Backend,
+    settings: Settings,
+) -> None:
+    """A backend that takes longer than a plain read allows must still be waited for.
+
+    Simulated at the boundary the bug actually lived at: a response that arrives after the
+    *general* read budget would have expired, but inside the checkout budget. Before the fix
+    this raised ``CardCheckoutOutcomeUnknownError`` and the link was lost for good.
+    """
+
+    async def slow_but_successful(request: httpx.Request) -> httpx.Response:
+        read_budget = request.extensions["timeout"]["read"]
+        assert read_budget > settings.read_timeout
+        await asyncio.sleep(0)  # the await point a real slow response would suspend at
+        return httpx.Response(200, json=envelope(card_checkout_payload()))
+
+    signed_in.checkout.mock(side_effect=slow_but_successful)
+
+    result = await open_checkout(purchase_service, card_service)
+
+    assert result["checkout_url"] == CHECKOUT_URL
+    assert result["payment_reference"] == PAYMENT_REFERENCE
+
+
+async def test_the_result_tells_the_assistant_the_link_is_the_confirmation(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """The exact QA failure, asserted as a property of the result.
+
+    No signal that "the payment page opened" exists anywhere in this system, so waiting for
+    one means never handing over a link that already works.
+    """
+    result = await open_checkout(purchase_service, card_service)
+
+    note = result["link_delivery_note"].lower()
+    assert "this result is the confirmation" in note
+    assert "show the user the full checkout_url immediately" in note
+    assert "do not wait for" in note
+    assert "never reply that you cannot give them a link" in note
+    assert "optional" in note, "opening a browser has to be described as optional"
+
+
+async def test_no_branch_of_a_successful_checkout_asks_for_a_page_opened_confirmation(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """Guards the wording itself: nothing may read as "tell me the page opened first"."""
+    result = await open_checkout(purchase_service, card_service)
+
+    prose = " ".join(value for value in result.values() if isinstance(value, str)).lower()
+    for forbidden in (
+        "confirm that the page opened",
+        "confirm the payment page opened",
+        "once the page has opened",
+        "after the page opens",
+        "cannot give you a link",
+    ):
+        assert forbidden not in prose, f"the checkout result asks the assistant to wait for {forbidden!r}"
+
+
+async def test_the_platforms_own_next_action_is_passed_through(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """``OPEN_CHECKOUT_URL`` is the platform saying the link is the deliverable."""
+    signed_in.stub_checkout(
+        httpx.Response(200, json=envelope({**card_checkout_payload(), "next_action": "OPEN_CHECKOUT_URL"}))
+    )
+
+    result = await open_checkout(purchase_service, card_service)
+
+    assert result["next_action"] == "OPEN_CHECKOUT_URL"
+
+
+async def test_the_platforms_amount_is_reported_as_the_exact_one(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """The platform prices the Session it just opened, so its figure is not a guess."""
+    signed_in.stub_checkout(httpx.Response(200, json=envelope(card_checkout_payload(amount="12.34"))))
+
+    result = await open_checkout(purchase_service, card_service)
+
+    assert result["amount"] == "12.34"
+    assert result["amount_is_final"] is True
+    note = result["amount_note"].lower()
+    assert "exact amount" in note
+    assert "do not tell the user the final amount may differ" in note
+
+
+async def test_a_platform_that_states_no_amount_falls_back_and_says_so(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """The quote's figure may stand in, but must never be presented as the settled one."""
+    signed_in.stub_checkout(httpx.Response(200, json=envelope(card_checkout_payload(amount=None))))
+
+    result = await open_checkout(purchase_service, card_service)
+
+    assert result["amount"] == "8.06"
+    assert result["amount_is_final"] is False
+    assert "did not restate the amount" in result["amount_note"].lower()
+
+
+async def test_the_expiry_shown_is_the_platforms_and_no_local_countdown_is_promised(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """The only real deadline is Stripe's session expiry, which the platform sends."""
+    result = await open_checkout(purchase_service, card_service)
+
+    assert result["expires_at"] == "2026-01-01T00:30:00+00:00"
+    note = result["expiry_note"].lower()
+    assert "the platform's own expiry" in note
+    assert "never invent one" in note
+    assert "held or reserved for some number of minutes" in note
+
+
+async def test_a_lost_answer_offers_the_retry_instead_of_a_dead_end(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """When no link comes back, the honest answer still has a way forward in it.
+
+    The old message told the assistant the link "could not be opened", which is a claim
+    about the platform this server has no evidence for -- in QA the platform had opened one.
+    """
+    reference = await prepare(purchase_service)
+    signed_in.stub_checkout_error(httpx.ReadTimeout("slow"))
+
+    with pytest.raises(CardCheckoutOutcomeUnknownError) as excinfo:
+        await card_service.create_card_checkout(quote_reference=reference)
+
+    message = str(excinfo.value).lower()
+    assert "nothing has been charged" in message
+    assert "lost answer, not a refusal" in message
+    assert "try the same prepared plan again" in message
+    assert "do not prepare a new quote" in message
+
+    details = excinfo.value.details
+    assert details["charged"] is False
+    assert details["retry_safe"] is True
+    assert "cannot charge the user twice" in details["retry_note"].lower()
+
+
+async def test_the_real_backend_checkout_envelope_yields_the_link(
+    purchase_service: PurchasePreparationService, card_service: CardPaymentService, signed_in: Backend
+) -> None:
+    """The wire format the eSIM backend actually produces, pinned verbatim.
+
+    Captured by serializing the backend's own ``McpCardCheckoutResponse`` through its own
+    ``ResponseHelper.success_data_response`` and FastAPI's encoder -- so the *shape*, the
+    field names and the envelope are the platform's, not a restatement of them. Only the
+    hosted-page host is replaced with a placeholder, because no committed file in this
+    repository may name a real one.
+
+    If the platform ever renames ``checkout_url``, this is the test that fails.
+    """
+    wire = {
+        "status": "success",
+        "totalCount": 0,
+        "data": {
+            "payment_reference": "8a59d9b0-c7ef-4a8c-b816-d11162491d38",
+            "order_id": "8a59d9b0-c7ef-4a8c-b816-d11162491d38",
+            "checkout_url": "https://checkout.test/c/pay/cs_test_a1n7dNMiFfxQVndu#fidkdWxOYHwnPyd1blpx",
+            "status": "PENDING",
+            "amount": "0.88",
+            "currency": "USD",
+            "expires_at": "2026-08-06T11:13:14+00:00",
+            "next_action": "OPEN_CHECKOUT_URL",
+            "idempotent_replay": False,
+            "message": "A secure payment page was opened for this plan. Nothing has been charged yet.",
+        },
+        "title": "Success",
+        "message": None,
+        "developerMessage": None,
+        "responseCode": 200,
+    }
+    signed_in.stub_checkout(httpx.Response(200, json=wire))
+
+    result = await open_checkout(purchase_service, card_service)
+
+    assert result["checkout_url"] == wire["data"]["checkout_url"]
+    assert result["payment_reference"] == "8a59d9b0-c7ef-4a8c-b816-d11162491d38"
+    assert result["order_id"] == "8a59d9b0-c7ef-4a8c-b816-d11162491d38"
+    assert result["order_state"] == "unpaid"
+    assert result["amount"] == "0.88"
+    assert result["amount_is_final"] is True
+    assert result["next_action"] == "OPEN_CHECKOUT_URL"
+    assert result["paid"] is False
+    assert result["charged"] is False
+    assert result["provisioned"] is False
 
 
 # ------------------------------------------------------------------- opening a checkout

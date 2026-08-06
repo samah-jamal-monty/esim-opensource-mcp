@@ -17,6 +17,7 @@ The properties asserted here are the ones that cost real money if they regress:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -60,6 +61,7 @@ from esim_mcp.purchase.service import PurchaseQuoteService
 from esim_mcp.purchase.store import QuoteOwner
 from esim_mcp.purchase.validation import new_quote_id
 from esim_mcp.session.identity import ClientIdentityProvider
+from esim_mcp.settings import Settings
 from esim_mcp.tools.authentication import AuthenticationService
 from esim_mcp.tools.purchase_execution import PurchaseConfirmationService
 from esim_mcp.tools.purchase_preparation import PurchasePreparationService, user_ref_of
@@ -314,6 +316,90 @@ async def test_a_quote_whose_balance_did_not_cover_the_plan_is_refused_locally(
         await confirmation_service.confirm_purchase(quote_reference=reference)
 
     assert not signed_in.purchase_calls
+
+
+# ------------------------------------- the purchase is waited for (QA regression, wallet)
+#
+# The sibling of the card-checkout timeout bug, and the more expensive of the two.
+#
+# What happened in QA: a signed-in user confirmed a 0.90 USD wallet purchase. The MCP sent
+# one request, gave up after the general 20s read budget, and reported "the platform did not
+# confirm the outcome of this purchase". The platform had in fact completed it -- order row
+# at +8s, wallet debited at +10s, eSIM issued at +59s, response at +65s. The user was
+# charged, an eSIM existed, and this server could say neither.
+#
+# The route delegates to the platform's shared assign flow, which provisions a SIM profile
+# against the eSIM hub before answering. It is the slowest call in the system and it was
+# running on the budget sized for single cached reads.
+
+
+async def test_the_wallet_purchase_post_gets_the_longest_read_budget(
+    purchase_service: PurchasePreparationService,
+    confirmation_service: PurchaseConfirmationService,
+    signed_in: Backend,
+    settings: Settings,
+) -> None:
+    """The one call that spends money is the one that must never be abandoned early."""
+    reference = await prepare(purchase_service)
+
+    await confirmation_service.confirm_purchase(quote_reference=reference)
+
+    timeout = signed_in.purchase_calls[0].extensions["timeout"]
+    assert timeout["read"] == settings.purchase_read_timeout
+    assert settings.purchase_read_timeout > settings.read_timeout, (
+        "a wallet purchase must not run on the budget sized for single cached reads"
+    )
+    assert settings.purchase_read_timeout > settings.checkout_read_timeout, (
+        "provisioning an eSIM takes longer than opening a payment page, and costs more to abandon"
+    )
+
+
+async def test_a_slow_provisioning_platform_still_yields_the_purchase_result(
+    purchase_service: PurchasePreparationService,
+    confirmation_service: PurchaseConfirmationService,
+    signed_in: Backend,
+    settings: Settings,
+) -> None:
+    """A purchase that outlives the general read budget must still be waited for.
+
+    Before the fix this raised ``PurchaseOutcomeUnknownError`` while the platform was busy
+    succeeding, leaving the user charged and the server unable to say so.
+    """
+
+    async def slow_but_successful(request: httpx.Request) -> httpx.Response:
+        read_budget = request.extensions["timeout"]["read"]
+        assert read_budget > settings.read_timeout
+        await asyncio.sleep(0)  # the await point a real slow response would suspend at
+        return httpx.Response(200, json=envelope(purchase_result_payload()))
+
+    signed_in.purchase.mock(side_effect=slow_but_successful)
+    reference = await prepare(purchase_service)
+
+    result = await confirmation_service.confirm_purchase(quote_reference=reference)
+
+    assert result["status"] == "purchased"
+    assert result["charged"] is True
+    assert len(signed_in.purchase_calls) == 1, "a slow purchase must never be sent twice"
+
+
+async def test_a_purchase_that_outlives_even_that_budget_is_still_never_re_sent(
+    purchase_service: PurchasePreparationService,
+    confirmation_service: PurchaseConfirmationService,
+    signed_in: Backend,
+) -> None:
+    """Widening the budget must not weaken the rule that matters most.
+
+    A wider window makes an unknown outcome rarer; it does not make one safe. The platform
+    does not honour the idempotency key on this route, so a second send could buy the plan
+    twice -- this server must still send exactly once and report honestly.
+    """
+    signed_in.stub_purchase_error(httpx.ReadTimeout("slower than any budget"))
+    reference = await prepare(purchase_service)
+
+    with pytest.raises(PurchaseOutcomeUnknownError):
+        await confirmation_service.confirm_purchase(quote_reference=reference)
+
+    assert len(signed_in.purchase_calls) == 1
 
 
 # ------------------------------------------------------------------------ the happy path

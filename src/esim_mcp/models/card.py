@@ -118,6 +118,11 @@ class BackendCardCheckout(BaseModel):
     amount: str | float | int | None = None
     currency: str | None = None
     expires_at: str | None = None
+    #: The platform's own instruction for what to do with this payload. It sends
+    #: ``OPEN_CHECKOUT_URL``, which is the platform stating that the link is the deliverable
+    #: -- there is no second signal to wait for and no "the page opened" acknowledgement to
+    #: look for, because the platform never sends one.
+    next_action: str | None = None
     idempotent_replay: bool = False
     #: Named so it is known to be *dropped*, never forwarded. A correlation id is a backend
     #: tracing handle: useful in a log line on the platform's side, meaningless and

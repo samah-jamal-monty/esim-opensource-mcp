@@ -318,8 +318,14 @@ class BackendApiClient:
         currency: str | None = None,
         credentials: RequestCredentials | None = None,
         idempotency_key: SecretStr | None = None,
+        read_timeout: float | None = None,
     ) -> BackendOutcome:
         """Send exactly one request and report what came back, without raising on failure.
+
+        ``read_timeout`` widens the pooled client's read budget for this one call. It exists
+        for the card checkout, whose endpoint does far more work than anything else this
+        server calls: abandoning that request early does not prevent the work, it only
+        discards the answer, and the answer is the payment link.
 
         There is **no retry here, by construction**: this is the path a purchase takes, and a
         repeated send is only ever safe when the caller decides to make it, with the same
@@ -342,7 +348,9 @@ class BackendApiClient:
         )
         started = time.monotonic()
         try:
-            response = await self._client.request(method.upper(), url, json=json_body, headers=headers)
+            response = await self._client.request(
+                method.upper(), url, json=json_body, headers=headers, **self._timeout_override(read_timeout)
+            )
         except httpx.TimeoutException:
             logger.warning(
                 "backend_call_timeout",
@@ -376,6 +384,23 @@ class BackendApiClient:
             },
         )
         return _outcome_of(response)
+
+    def _timeout_override(self, read_timeout: float | None) -> dict[str, Any]:
+        """Per-request timeout kwargs, or nothing when the pooled default applies.
+
+        Only the *read* budget moves. Connect, write and pool stay as configured, because a
+        slow endpoint is slow while it thinks, not while it accepts a connection.
+        """
+        if read_timeout is None:
+            return {}
+        return {
+            "timeout": httpx.Timeout(
+                connect=self._settings.connect_timeout,
+                read=read_timeout,
+                write=self._settings.write_timeout,
+                pool=self._settings.pool_timeout,
+            )
+        }
 
     def _parse(self, response: httpx.Response) -> Any:
         """Validate the envelope and return its ``data``, or raise a typed error."""

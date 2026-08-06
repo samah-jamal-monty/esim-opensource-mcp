@@ -50,7 +50,17 @@ EXECUTION_TOOL_NAMES = {"confirm_purchase"}
 
 CARD_TOOL_NAMES = {"create_card_checkout", "check_card_payment_status"}
 
-TOOL_NAMES = AUTH_TOOL_NAMES | CATALOG_TOOL_NAMES | PURCHASE_TOOL_NAMES | EXECUTION_TOOL_NAMES | CARD_TOOL_NAMES
+#: Read-only history of what the signed-in user already owns. Neither can change anything.
+ACCOUNT_TOOL_NAMES = {"get_my_esims", "get_order_history"}
+
+TOOL_NAMES = (
+    AUTH_TOOL_NAMES
+    | CATALOG_TOOL_NAMES
+    | PURCHASE_TOOL_NAMES
+    | EXECUTION_TOOL_NAMES
+    | CARD_TOOL_NAMES
+    | ACCOUNT_TOOL_NAMES
+)
 
 #: Capabilities this server still does not have. A description may only mention one of
 #: these as something the server *cannot* do, which is asserted separately.
@@ -111,7 +121,7 @@ async def test_server_instructions_are_published_to_the_client(settings: Setting
         "find_bundles_by_country",
         "get_bundle_details",
         "numbered list",
-        "may not include final tax",
+        "Do not warn the user that an amount",
         # Phase 3: purchase preparation.
         "prepare_purchase",
         "Preparing is not buying",
@@ -190,6 +200,8 @@ TOOLS_NAMED_IN_INSTRUCTIONS = {
     "confirm_purchase",
     "create_card_checkout",
     "check_card_payment_status",
+    "get_my_esims",
+    "get_order_history",
 }
 
 
@@ -298,7 +310,7 @@ def test_every_tool_has_a_human_title_and_substantial_description(tools: list[To
                 "numbered list",
                 "never read a code out",
                 "never invent one",
-                "may not include final tax",
+                "do not warn that they may change or exclude tax",
                 "needs no login",
                 "never describe it as the platform's whole",
             ],
@@ -307,7 +319,13 @@ def test_every_tool_has_a_human_title_and_substantial_description(tools: list[To
         ("list_cruise_bundles", ["when:", "cruise", "before promising coverage", "needs no login"]),
         (
             "get_bundle_details",
-            ["when:", "never invent a code", "may not include final tax", "cannot buy a plan", "needs no login"],
+            [
+                "when:",
+                "never invent a code",
+                "without warning that it may change or exclude tax",
+                "charges anything",
+                "needs no login",
+            ],
         ),
         (
             "prepare_purchase",

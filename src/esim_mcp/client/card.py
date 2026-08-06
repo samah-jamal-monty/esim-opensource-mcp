@@ -83,6 +83,7 @@ class CardCheckoutApiClient:
         search_context: SearchContext,
         locale: str,
         currency: str,
+        read_timeout: float | None = None,
     ) -> BackendOutcome:
         """Send one checkout request and return whatever the platform answered.
 
@@ -90,6 +91,13 @@ class CardCheckoutApiClient:
         and the caller decides -- with the same key it passed in -- whether to ask the platform
         again. Nothing in this method may ever generate a key of its own, because a second key
         is the one way a second payment page could come into existence.
+
+        ``read_timeout`` is the caller's budget for this one call, and it is deliberately
+        wider than the one every other route gets. This endpoint reads the bundle from the
+        eSIM hub, checks its availability, writes an order row, reads a currency rate, opens
+        a Stripe Checkout Session and writes the order row again -- six sequential
+        third-party round trips before it can answer. Hanging up early does not stop any of
+        that: the page is created regardless, and all that is lost is the link to it.
 
         The body carries **exactly three fields** and no more. The endpoint declares
         ``extra="forbid"``, so one unexpected key -- a helpfully-added ``payment_type``, an
@@ -130,6 +138,7 @@ class CardCheckoutApiClient:
             currency=currency,
             credentials=RequestCredentials(access_token=access_token),
             idempotency_key=idempotency_key,
+            read_timeout=read_timeout,
         )
 
     async def get_payment_status(

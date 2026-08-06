@@ -229,6 +229,7 @@ class PurchaseConfirmationService:
                 search_context=quote.search_context,
                 locale=quote.locale,
                 currency=quote.price.currency,
+                read_timeout=self._settings.purchase_read_timeout,
             )
         except (BackendTimeoutError, BackendUnavailableError):
             # The request may have been executed in full before the connection died. This is

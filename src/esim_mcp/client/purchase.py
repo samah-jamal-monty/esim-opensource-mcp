@@ -71,12 +71,19 @@ class PurchaseApiClient:
         search_context: SearchContext,
         locale: str,
         currency: str,
+        read_timeout: float | None = None,
     ) -> BackendOutcome:
         """Send one purchase and return whatever the platform answered.
 
         **Never retried here, at any level.** One call in, one outcome out: a timeout raises,
         and the caller decides -- with the same key it passed in -- whether to ask the
         platform again. Nothing in this method may ever generate a key of its own.
+
+        ``read_timeout`` is the caller's budget, and it is the longest one this server uses.
+        The platform's shared assign flow debits the wallet and issues an eSIM against the
+        eSIM hub before it replies, which takes upwards of a minute. Hanging up does not
+        cancel a penny of it: the money still leaves, the eSIM is still issued, and the only
+        casualty is this server's knowledge of whether either happened.
 
         ``currency`` is sent explicitly rather than omitted so the platform can refuse a
         purchase whose settlement currency differs from the one the quote was priced in. A
@@ -100,4 +107,5 @@ class PurchaseApiClient:
             currency=currency,
             credentials=RequestCredentials(access_token=access_token),
             idempotency_key=idempotency_key,
+            read_timeout=read_timeout,
         )

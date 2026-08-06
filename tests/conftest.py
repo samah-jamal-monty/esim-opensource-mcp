@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from esim_mcp.client.account import AccountApiClient
 from esim_mcp.client.auth import AuthApiClient
 from esim_mcp.client.base import BackendApiClient
 from esim_mcp.client.card import CardCheckoutApiClient
@@ -25,6 +26,7 @@ from esim_mcp.session.identity import ClientIdentity, ClientIdentityProvider
 from esim_mcp.session.manager import SessionManager
 from esim_mcp.session.store import InMemorySessionStore
 from esim_mcp.settings import Settings
+from esim_mcp.tools.account import AccountService
 from esim_mcp.tools.authentication import AuthenticationService
 from esim_mcp.tools.card_checkout import CardPaymentService
 from esim_mcp.tools.catalog import CatalogService
@@ -623,6 +625,40 @@ def card_service(
     identity_a: StubIdentityProvider,
 ) -> CardPaymentService:
     return make_card_service(identity_a)
+
+
+# --------------------------------------------------------------- read-only account history
+
+
+@pytest.fixture
+def account_client(backend_client: BackendApiClient) -> AccountApiClient:
+    return AccountApiClient(backend_client)
+
+
+@pytest.fixture
+def make_account_service(
+    settings: Settings,
+    account_client: AccountApiClient,
+    session_manager: SessionManager,
+) -> Callable[[ClientIdentityProvider], AccountService]:
+    """Build account services for different callers over one shared session manager.
+
+    Sharing the session manager is the point: "one client cannot read another's eSIMs" is
+    only a meaningful assertion when both callers are looking at the same session store.
+    """
+
+    def factory(identity_provider: ClientIdentityProvider) -> AccountService:
+        return AccountService(settings, account_client, session_manager, identity_provider)
+
+    return factory
+
+
+@pytest.fixture
+def account_service(
+    make_account_service: Callable[[ClientIdentityProvider], AccountService],
+    identity_a: StubIdentityProvider,
+) -> AccountService:
+    return make_account_service(identity_a)
 
 
 def mock_login_routes(respx_mock: Any, *, email: str = "person@example.com") -> None:

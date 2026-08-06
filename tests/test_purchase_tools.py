@@ -324,14 +324,43 @@ async def test_a_card_quote_creates_no_payment_intent_and_invents_no_link(
     assert "create_card_checkout" in note
 
 
-async def test_a_card_quote_says_the_final_amount_is_not_confirmed(
+async def test_a_card_quote_never_hedges_about_the_amount_the_platform_gave(
     purchase_service: PurchasePreparationService, signed_in: Backend
 ) -> None:
+    """The price note must not invent caveats the platform never stated.
+
+    The flags stay: they are machine-readable facts about what has and has not been settled.
+    The *prose* is what the assistant repeats to a user, and it used to tell them the amount
+    "may not include final tax" and would "be confirmed at checkout" -- neither of which the
+    eSIM platform says anywhere. It priced the plan and sent the price.
+    """
     result = await purchase_service.prepare_purchase(bundle_code=BUNDLE_CODE, payment_method="Card")
 
     assert result["pricing"]["final_amount_confirmed"] is False
     assert result["pricing"]["tax_included_confirmed"] is False
-    assert "final tax" in result["price_note"].lower()
+
+    note = result["price_note"].lower()
+    for invented in ("may not include", "final tax", "may differ", "will be confirmed"):
+        assert invented not in note, f"the price note reintroduced the unsupported claim {invented!r}"
+    assert "do not" in note
+
+
+async def test_a_quote_never_presents_its_own_expiry_as_a_held_price(
+    purchase_service: PurchasePreparationService, signed_in: Backend
+) -> None:
+    """The quote TTL is this server's cache lifetime, not a promise from the platform.
+
+    Surfacing it bare produced "your price is valid for about five minutes" -- an offer
+    nobody made. The countdown stays (the model needs it to know when to re-prepare), but it
+    now travels with an explicit instruction never to read it out as a guarantee.
+    """
+    result = await purchase_service.prepare_purchase(bundle_code=BUNDLE_CODE, payment_method="Card")
+
+    assert result["expiry_is_local_bookkeeping"] is True
+    note = result["expiry_note"].lower()
+    assert "not a price guarantee" in note
+    assert "never tell the user the price is held" in note
+    assert "valid for some number of minutes" in note
 
 
 @pytest.mark.parametrize("method", ["DCB", "dcb", "PayPal", ""])

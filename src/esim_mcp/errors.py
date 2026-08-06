@@ -463,9 +463,11 @@ class CardCheckoutOutcomeUnknownError(EsimMcpError):
 
     code = "card_checkout_outcome_unknown"
     default_message = (
-        "The eSIM platform did not confirm whether the card payment page was opened. Nothing has been charged -- "
-        "a payment page is not a payment. Do NOT prepare a new quote for the same plan; tell the user the link "
-        "could not be opened and offer to try the same one again shortly."
+        "The answer to the card checkout request never arrived, so this server has no payment link to hand over. "
+        "Nothing has been charged -- a payment page is not a payment. This is a lost answer, not a refusal: the "
+        "platform may well have created the page. Do NOT prepare a new quote for the same plan. Tell the user the "
+        "link did not come back this time and offer to try the SAME prepared plan again right away, which is what "
+        "retrieves a link."
     )
     retryable = True
 

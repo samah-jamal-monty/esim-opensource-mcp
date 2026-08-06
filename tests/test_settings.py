@@ -52,6 +52,27 @@ def test_production_accepts_strong_configuration() -> None:
     assert settings.allows_development_identity is False
 
 
+def test_the_checkout_budget_defaults_wider_than_the_general_read_budget() -> None:
+    """The slowest endpoint on the platform must not run on the budget sized for cached reads.
+
+    Abandoning a checkout POST early does not cancel it: the platform still opens the hosted
+    payment page, and the only casualty is this server's chance to read the link.
+    """
+    settings = Settings.build(api_base_url="https://backend.test")
+
+    assert settings.checkout_read_timeout > settings.read_timeout
+    # Provisioning an eSIM takes longer than opening a payment page, and abandoning it costs
+    # more: the wallet is debited before the eSIM is issued.
+    assert settings.purchase_read_timeout > settings.checkout_read_timeout
+
+
+def test_the_checkout_budget_is_configurable_on_its_own() -> None:
+    settings = Settings.build(api_base_url="https://backend.test", checkout_read_timeout=90.0)
+
+    assert settings.checkout_read_timeout == 90.0
+    assert settings.read_timeout == 20.0, "widening the checkout budget must not move the general one"
+
+
 def test_non_production_generates_ephemeral_salt() -> None:
     settings = Settings.build(api_base_url="https://backend.test")
     assert settings.device_id_salt is not None
@@ -65,6 +86,10 @@ def test_non_production_generates_ephemeral_salt() -> None:
         ("default_currency", "DOLLAR"),
         ("connect_timeout", 0),
         ("read_timeout", -1),
+        ("checkout_read_timeout", 0),
+        ("purchase_read_timeout", 0),
+        ("purchase_read_timeout", 10_000),
+        ("checkout_read_timeout", 10_000),
         ("pool_timeout", 10_000),
         ("port", 0),
         ("login_challenge_ttl_seconds", 5),

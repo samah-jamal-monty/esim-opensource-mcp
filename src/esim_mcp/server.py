@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from mcp.server.mcpserver import MCPServer
 
 from esim_mcp import __version__
+from esim_mcp.client.account import AccountApiClient
 from esim_mcp.client.auth import AuthApiClient
 from esim_mcp.client.base import BackendApiClient
 from esim_mcp.client.card import CardCheckoutApiClient
@@ -35,6 +36,7 @@ from esim_mcp.session.identity import ClientIdentityProvider, build_identity_pro
 from esim_mcp.session.manager import SessionManager
 from esim_mcp.session.store import InMemorySessionStore, SessionStore
 from esim_mcp.settings import Settings, Transport, get_settings
+from esim_mcp.tools.account import AccountService, register_account_tools
 from esim_mcp.tools.authentication import AuthenticationService, register_authentication_tools
 from esim_mcp.tools.card_checkout import CardPaymentService, register_card_checkout_tools
 from esim_mcp.tools.catalog import CatalogService, register_catalog_tools
@@ -101,8 +103,10 @@ whether they want details on one. When the user picks one ("the second one"), ca
 get_bundle_details with that option's own bundle_code -- never invent a code, a price, a \
 data allowance, a validity or a country.
 - Only apply a filter the user actually asked for, and say when a result was narrowed.
-- Displayed catalogue prices may not include final tax; pass that on rather than promising a \
-final amount.
+- Quote the platform's prices exactly as the tools give them. Do not warn the user that an \
+amount is provisional, approximate or subject to tax the platform never mentioned, and do not \
+promise that it will be recalculated later. The platform makes no such statement, so neither \
+should you.
 
 Preparing a plan for purchase:
 - When a signed-in user picks a real plan and wants to go ahead, use prepare_purchase. \
@@ -152,6 +156,11 @@ Paying by card:
 - A quote prepared for card payment is paid on the eSIM platform's own secure page, not \
 here. Once the user has heard the amount and explicitly agreed to pay it by card, use \
 create_card_checkout and give them the link it returns.
+- Show that link immediately and in full, in the same reply. The tool result is the \
+confirmation: there is no separate signal that a payment page opened, loaded or was reached, \
+so never wait for one, never ask the user whether a page opened, and never say you cannot \
+give them a link. Whether a browser opens is up to them and is optional -- the link is the \
+result.
 - Never ask the user for a card number, an expiry date, a security code, a cardholder name \
 or any other card detail, and never offer to type one in for them. You never see a card: \
 they enter it only on Stripe's own secure page, which the link opens in their browser. If \
@@ -172,15 +181,30 @@ prepare the plan again. If it comes back unresolved or needing support, never sa
 succeeded and never say it failed: tell the user the platform is investigating it and that \
 they should contact eSIM support, and do not open another payment page.
 
+What the user already has:
+- get_my_esims lists the eSIMs on their account: the plan on each, whether it has started or \
+expired, and what is needed to install it. Use it whenever they ask about plans they already \
+own -- "my eSIMs", "my bundles", "where is the one I just bought", "how do I install it". \
+Plans the platform sells are a different question: use the catalogue tools for those.
+- get_order_history lists what they have bought and paid. Use it for "my orders", "what did \
+I pay", "did my order go through".
+- Neither reports data usage, because the platform sends none. Never tell a user how much \
+data they have left, and never work it out from a date.
+- You cannot install, activate or transfer an eSIM. Give them the SM-DP+ address and \
+activation code and say plainly that they add it on their own device. Treat those as \
+credentials: a profile installs once, so give them only to the user who owns the eSIM.
+- If an account has no eSIMs or no orders, say so plainly and never invent one.
+
 Scope: this version can sign a user in, report login status, read their own profile and \
-wallet balance, sign them out, browse the plan catalogue read-only, prepare a purchase quote \
-for a plan the user picked, buy that prepared plan from their wallet once they have \
-explicitly agreed to the amount, and open the platform's own secure card payment page for a \
-prepared card quote and report what happened to that payment. It cannot take card details \
-itself, use vouchers or promotions, top up a wallet, refund or cancel a completed order, or \
-activate, provision or check the usage of an eSIM. Say so plainly if the user asks for one \
-of those, and never imply that something happened which these tools do not do. Always \
-confirm the exact amount with the user before anything is charged.
+wallet balance, sign them out, browse the plan catalogue read-only, list the eSIMs they \
+already own and the orders they have placed, prepare a purchase quote for a plan the user \
+picked, buy that prepared plan from their wallet once they have explicitly agreed to the \
+amount, and open the platform's own secure card payment page for a prepared card quote and \
+report what happened to that payment. It cannot take card details itself, use vouchers or \
+promotions, top up a wallet, refund or cancel a completed order, or activate, provision or \
+check the usage of an eSIM. Say so plainly if the user asks for one of those, and never \
+imply that something happened which these tools do not do. Always confirm the exact amount \
+with the user before anything is charged.
 """
 
 
@@ -195,6 +219,7 @@ class ServerComponents:
     wallet_client: WalletApiClient
     purchase_client: PurchaseApiClient
     card_client: CardCheckoutApiClient
+    account_client: AccountApiClient
     store: SessionStore
     quote_store: PurchaseQuoteStore
     execution_store: PurchaseExecutionStore
@@ -209,6 +234,7 @@ class ServerComponents:
     purchase_service: PurchasePreparationService
     confirmation_service: PurchaseConfirmationService
     card_service: CardPaymentService
+    account_service: AccountService
     server: MCPServer
 
     async def aclose(self) -> None:
@@ -237,6 +263,7 @@ def build_components(
     wallet_client = WalletApiClient(resolved_backend)
     purchase_client = PurchaseApiClient(resolved_backend)
     card_client = CardCheckoutApiClient(resolved_backend)
+    account_client = AccountApiClient(resolved_backend)
     resolved_store = store or InMemorySessionStore()
     session_manager = SessionManager(resolved_settings, resolved_store, auth_client)
     resolved_identity = identity_provider or build_identity_provider(resolved_settings)
@@ -286,6 +313,16 @@ def build_components(
         checkout_service,
     )
 
+    # Read-only account history. Deliberately built with no quote store, no execution
+    # store and no checkout store: these tools answer questions about what the user
+    # already owns, and there is nothing in them that could create or alter any of it.
+    account_service = AccountService(
+        resolved_settings,
+        account_client,
+        session_manager,
+        resolved_identity,
+    )
+
     # A prepared quote must not outlive the session that created it: on logout, on session
     # invalidation and on a failed token rotation, every quote of that session is cancelled,
     # and the execution and checkout records (with their idempotency keys) go with it. A key
@@ -327,6 +364,7 @@ def build_components(
     register_purchase_preparation_tools(server, purchase_service)
     register_purchase_execution_tools(server, confirmation_service)
     register_card_checkout_tools(server, card_service)
+    register_account_tools(server, account_service)
 
     components = ServerComponents(
         settings=resolved_settings,
@@ -336,6 +374,7 @@ def build_components(
         wallet_client=wallet_client,
         purchase_client=purchase_client,
         card_client=card_client,
+        account_client=account_client,
         store=resolved_store,
         quote_store=resolved_quote_store,
         execution_store=resolved_execution_store,
@@ -350,6 +389,7 @@ def build_components(
         purchase_service=purchase_service,
         confirmation_service=confirmation_service,
         card_service=card_service,
+        account_service=account_service,
         server=server,
     )
     return components

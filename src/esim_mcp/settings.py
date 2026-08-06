@@ -77,6 +77,39 @@ class Settings(BaseSettings):
     default_currency: str = Field(default="USD", validation_alias="ESIM_MCP_DEFAULT_CURRENCY")
     connect_timeout: float = Field(default=5.0, gt=0, le=300, validation_alias="ESIM_MCP_CONNECT_TIMEOUT")
     read_timeout: float = Field(default=20.0, gt=0, le=300, validation_alias="ESIM_MCP_READ_TIMEOUT")
+    #: Read budget for the card-checkout POST specifically, which is the slowest call this
+    #: server makes by a wide margin: the platform's checkout endpoint performs up to six
+    #: sequential third-party round trips (two eSIM-hub reads, two order-row writes, a
+    #: currency rate and the Stripe Checkout Session) before it can answer. Every other route
+    #: this server calls is a single cached read, so :attr:`read_timeout` is sized for those.
+    #:
+    #: Giving up early here is not a neutral failure. The platform finishes the work anyway
+    #: and a real hosted payment page comes into existence, but this server never reads the
+    #: link or the payment reference and has no way to ask for either afterwards -- so a
+    #: successful checkout is reported to the user as "the payment page could not be opened".
+    #: That asymmetry is why this budget is generous rather than tight.
+    checkout_read_timeout: float = Field(
+        default=45.0, gt=0, le=300, validation_alias="ESIM_MCP_CHECKOUT_READ_TIMEOUT"
+    )
+    #: Read budget for the wallet-purchase POST. Larger than every other budget here, and for
+    #: a harder reason than the card one.
+    #:
+    #: That route delegates to the platform's shared assign flow, which debits the wallet
+    #: *and then provisions an eSIM against the eSIM hub before it answers*. A measured run
+    #: took 65 seconds end to end: order row at +8s, wallet debited at +10s, eSIM issued at
+    #: +59s, response at +65s. Nothing about that is pathological -- issuing a SIM profile is
+    #: simply slow.
+    #:
+    #: Abandoning that request is worse than abandoning a checkout, and not by a little. The
+    #: platform finishes anyway: the money leaves the wallet, the eSIM is issued, the order
+    #: closes -- and this server, having hung up, can only report that it does not know
+    #: whether the user was charged. Worse, the platform does not honour the
+    #: ``Idempotency-Key`` on that route, so the "just try again" that an unknown outcome
+    #: invites can buy the plan a second time. Every one of those failures is bought by a
+    #: timeout that fired while the purchase was succeeding.
+    purchase_read_timeout: float = Field(
+        default=90.0, gt=0, le=300, validation_alias="ESIM_MCP_PURCHASE_READ_TIMEOUT"
+    )
     write_timeout: float = Field(default=20.0, gt=0, le=300, validation_alias="ESIM_MCP_WRITE_TIMEOUT")
     pool_timeout: float = Field(default=5.0, gt=0, le=300, validation_alias="ESIM_MCP_POOL_TIMEOUT")
     token_refresh_window_seconds: int = Field(

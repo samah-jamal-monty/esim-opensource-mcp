@@ -31,6 +31,30 @@ What it guarantees about payment pages
 * **A link is validated, not trusted.** Only a plain ``https`` address is ever passed on, and a
   page this server cannot later identify is not shown at all.
 
+The link is the deliverable
+---------------------------
+The platform answers a checkout request with the link and then says nothing further. There is
+no "the page opened" event, no browser callback and no tool that reports one, because none
+exists -- whether the user's browser ever loads the page is between them and their browser.
+
+That has to be stated in the result, and it is (:data:`LINK_IS_THE_RESULT`), because the
+failure it prevents is the expensive one: an assistant that treats "I have not been told the
+page opened" as a reason to withhold the link leaves the user unable to pay for a page the
+platform has already created for them. Every branch that produces a link therefore also
+carries the instruction to hand it over immediately and in full, and every branch that
+produces no link says plainly that retrying the same quote is what gets one.
+
+Where the timeout budget comes from
+-----------------------------------
+This is the slowest call this server makes. The platform's checkout endpoint reads the bundle
+from the eSIM hub, checks its availability, writes an order row, reads a currency rate, opens
+the Stripe Checkout Session and writes the order row again before it can answer. Abandoning
+that request early does not stop any of it: the page is created either way, and all that is
+lost is this server's only chance to read the link and the payment reference -- neither of
+which it can ask for afterwards. So the checkout POST gets its own generous budget
+(:attr:`~esim_mcp.settings.Settings.checkout_read_timeout`) rather than the one sized for
+single cached reads.
+
 Who is allowed to say a payment happened
 ----------------------------------------
 **The backend's existing signature-verified payment webhook, and nothing else.** Stripe calls
@@ -121,24 +145,43 @@ from esim_mcp.tools.purchase_preparation import user_ref_of
 
 logger = logging.getLogger(__name__)
 
-#: The sentence a fresh checkout result carries. It says what exists -- a page -- and, just as
-#: importantly, what does not: a payment.
-CHECKOUT_READY = "A secure payment page was opened for this plan. Nothing has been charged yet."
+#: The sentence a fresh checkout result carries. It says what exists -- a link the user can
+#: pay on -- and, just as importantly, what does not: a payment.
+CHECKOUT_READY = (
+    "The secure payment link for this plan is in checkout_url and is ready to give to the user now. Nothing has "
+    "been charged yet."
+)
+
+#: The rule this phase most has to enforce on the *assistant*, and the one it previously got
+#: wrong: this result **is** the confirmation. The platform answers a checkout request with
+#: the link and with nothing else afterwards -- there is no "the page opened" event, no
+#: browser callback and no second tool that reports one. An assistant that waits for one
+#: waits forever and withholds a link that already works, which is the single worst outcome
+#: this tool can produce: the user is left with no way to pay for a page the platform has
+#: already created for them.
+LINK_IS_THE_RESULT = (
+    "This result IS the confirmation. Show the user the full checkout_url immediately, in the same reply, exactly "
+    "as it appears here and with nothing removed or shortened. Do NOT wait for, ask for or look for any further "
+    "confirmation that a payment page 'opened', loaded or was reached: no such signal exists and none is coming. "
+    "Whether a browser opens is the user's business and is optional -- the link is the deliverable. Never reply "
+    "that you cannot give them a link, and never withhold one you have been given."
+)
 
 #: What the assistant should do once a link exists.
 CHECKOUT_NEXT_STEP = (
-    "Give the user the payment link and tell them the amount and the plan. Say plainly that nothing has been "
-    "charged yet and that they enter their card only on Stripe's secure page, which the link opens. Never ask "
-    "them for a card number, an expiry date, a security code or any other card detail, and never offer to enter "
-    "one for them. The platform has recorded an UNPAID order behind this page; it becomes a real purchase only "
-    "once the user pays on Stripe, so never describe it as bought, placed or reserved. Then wait: do not check "
-    "the payment until they say they have paid, or ask you to check."
+    "Give the user the payment link in full, together with the plan name and the amount. Say plainly that nothing "
+    "has been charged yet and that they enter their card only on Stripe's secure page, which the link opens. "
+    "Never ask them for a card number, an expiry date, a security code or any other card detail, and never offer "
+    "to enter one for them. The platform has recorded an UNPAID order behind this link; it becomes a real "
+    "purchase only once the user pays on Stripe, so never describe it as bought, placed or reserved. Then wait: "
+    "do not check the payment until they say they have paid, or ask you to check."
 )
 
 #: Repeated on a replayed checkout so the assistant does not describe one page as two.
 CHECKOUT_REPLAY_NOTE = (
-    "This payment page already existed and this is the same link, not a second one. The user is being asked to "
-    "pay once. Never tell them a new page was created or that they must pay again."
+    "This payment link already existed and this is the same link, not a second one. Give it to the user again "
+    "rather than treating the repeat as a problem. The user is being asked to pay once. Never tell them a new "
+    "page was created or that they must pay again."
 )
 
 #: The rule that has to survive into every card result, in every branch.
@@ -294,6 +337,7 @@ class CardPaymentService:
                 search_context=quote.search_context,
                 locale=quote.locale,
                 currency=quote.price.currency,
+                read_timeout=self._settings.checkout_read_timeout,
             )
         except (BackendTimeoutError, BackendUnavailableError):
             # A page may or may not have been opened. Nobody was charged either way -- the
@@ -598,28 +642,46 @@ def _classify_status_failure(status: int) -> EsimMcpError:
 
 
 def _unknown_details(checkout: CardCheckout) -> dict[str, Any]:
-    """Safe payload for a checkout whose outcome this server never learned."""
+    """Safe payload for a checkout whose outcome this server never learned.
+
+    ``retry_safe`` is about *money*, and by that measure retrying is safe: neither attempt
+    can charge anyone, because neither attempt touches a card. What a retry can leave behind
+    is a second unpaid order with its own payment page, since the platform does not key
+    checkout creation on the ``Idempotency-Key`` this server sends. That costs the user
+    nothing -- an unpaid page simply expires -- and it is plainly better than leaving them
+    with no way to pay at all, which is why the instruction is to try the same quote again
+    rather than to stop.
+    """
     return {
         "charged": False,
         "retry_safe": True,
         "new_quote_safe": False,
         "next_step": "retry_same_checkout",
         "attempts_remaining": checkout.attempts_remaining,
+        "retry_note": (
+            "Retrying the same prepared plan cannot charge the user twice: this server never touches a card, and "
+            "a payment page that nobody pays on simply expires. Offer the retry rather than telling the user "
+            "there is nothing you can do."
+        ),
     }
 
 
 # ------------------------------------------------------------------------ result shaping
 
 
-def _amount_text(value: Any, fallback: Decimal) -> str:
-    """Two-decimal string for an amount, preferring the platform's own figure.
+def _amount_text(value: Any, fallback: Decimal) -> tuple[str, bool]:
+    """Two-decimal string for an amount, plus whether the platform is the one that said it.
 
-    The platform is authoritative for what the card will actually be charged: it applies the
-    final tax this server is not able to compute. The quote's displayed amount is used only
-    when the platform sent none, and never to *override* one.
+    The platform is authoritative for what the card will be charged: the figure it returns
+    here is the amount it opened the payment page for. The quote's displayed amount is used
+    only when the platform sent none, and never to *override* one -- and the caller is told
+    which of the two it got, because "this is the exact amount" and "this is what the
+    catalogue said" are different claims and only one of them is safe to make.
     """
     parsed = decimal_from_number(value)
-    return money_text(parsed if parsed is not None else fallback)
+    if parsed is not None:
+        return money_text(parsed), True
+    return money_text(fallback), False
 
 
 def _checkout_result(
@@ -639,14 +701,21 @@ def _checkout_result(
     a later status read is about) and a dangerous one to misread, so it travels next to
     ``paid: false`` and a ``next_step`` that says in words that the order only becomes a
     purchase when the user pays on Stripe's page.
+
+    ``amount_is_final`` says whether the figure came from the platform. When it did -- which
+    is the normal case, because the platform prices the Checkout Session it just opened --
+    the amount is the exact one the card will be charged, and the assistant is told to state
+    it as such rather than to hedge about tax it has no information about.
     """
+    amount, amount_from_platform = _amount_text(checkout.amount, quote.price.displayed_amount)
     payload: dict[str, Any] = {
         "status": "checkout_ready",
+        "checkout_url": link,
         "quote_reference": quote.quote_id,
         "payment_reference": payment_reference,
-        "checkout_url": link,
         "payment_method": "Card",
-        "amount": _amount_text(checkout.amount, quote.price.displayed_amount),
+        "amount": amount,
+        "amount_is_final": amount_from_platform,
         "currency": (checkout.currency or quote.price.currency or "").strip().upper(),
         "payment_status": (checkout.payment_status or CardPaymentStatus.PENDING).value,
         "charged": False,
@@ -658,12 +727,29 @@ def _checkout_result(
             "validity": quote.bundle.validity_display,
         },
         "message": CHECKOUT_READY,
+        "link_delivery_note": LINK_IS_THE_RESULT,
+        "amount_note": (
+            "This is the exact amount the platform opened the payment page for and the exact amount the card will "
+            "be charged. State it plainly. Do not hedge about tax, and do not tell the user the final amount may "
+            "differ -- the platform has settled it."
+            if amount_from_platform
+            else "The platform did not restate the amount, so this is the amount from the prepared quote. Give the "
+            "user this figure and let Stripe's own page show them what it will charge."
+        ),
         "card_entry_note": CARD_ENTRY_NOTE,
         "next_step": CHECKOUT_NEXT_STEP,
         "proof_note": REDIRECT_IS_NOT_PROOF,
     }
+    if checkout.next_action:
+        # The platform's own instruction, passed through as it sent it. It says
+        # OPEN_CHECKOUT_URL: the link is the deliverable, and there is nothing else to await.
+        payload["next_action"] = checkout.next_action
     if checkout.expires_at:
         payload["expires_at"] = checkout.expires_at
+        payload["expiry_note"] = (
+            "This is the platform's own expiry for the payment page. It is the only deadline that is real here -- "
+            "never invent one, and never tell the user a price is held or reserved for some number of minutes."
+        )
     if checkout.order_id:
         payload["order_id"] = checkout.order_id
         payload["order_state"] = "unpaid"
@@ -816,10 +902,18 @@ def register_card_checkout_tools(server: MCPServer, service: CardPaymentService)
             "SAFE TO REPEAT: calling this twice for the same prepared quote returns the same "
             "payment link and never opens a second page, so the user is never asked to pay "
             "twice.\n"
-            "AFTER SUCCESS: give the user the link, the plan and the amount, and say plainly "
-            "that nothing has been charged yet. Then wait -- do not check the payment until "
-            "they say they have paid or ask you to check, and use check_card_payment_status "
-            "when they do."
+            "AFTER SUCCESS: the result contains checkout_url. Give the user that link in "
+            "full, in your very next reply, along with the plan and the amount, and say "
+            "plainly that nothing has been charged yet. The result itself is the "
+            "confirmation: there is NO further signal that a payment page 'opened', loaded "
+            "or was reached, so never wait for one, never ask the user whether a page "
+            "opened, and never answer that you cannot give them a link. Whether a browser "
+            "opens is optional and none of this server's business -- returning the link is "
+            "the whole job. Then wait -- do not check the payment until they say they have "
+            "paid or ask you to check, and use check_card_payment_status when they do.\n"
+            "IF NO LINK COMES BACK: that is a lost answer, not a refusal, and nothing was "
+            "charged. Offer to try the same prepared plan again straight away instead of "
+            "telling the user nothing can be done."
         ),
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
     )

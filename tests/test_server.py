@@ -42,8 +42,18 @@ PURCHASE_EXECUTION_TOOLS = {"confirm_purchase"}
 #: -- no ``pay``, no ``capture``, no ``confirm_card_payment``, no refund.
 CARD_CHECKOUT_TOOLS = {"create_card_checkout", "check_card_payment_status"}
 
+#: Read-only account history: what the user already owns, and what they already paid.
+#: Exactly two, both reads. There is deliberately no install, activate, label, share,
+#: cancel, refund or top-up tool alongside them -- a model cannot call what does not exist.
+ACCOUNT_TOOLS = {"get_my_esims", "get_order_history"}
+
 EXPECTED_TOOLS = (
-    AUTHENTICATION_TOOLS | CATALOG_TOOLS | PURCHASE_PREPARATION_TOOLS | PURCHASE_EXECUTION_TOOLS | CARD_CHECKOUT_TOOLS
+    AUTHENTICATION_TOOLS
+    | CATALOG_TOOLS
+    | PURCHASE_PREPARATION_TOOLS
+    | PURCHASE_EXECUTION_TOOLS
+    | CARD_CHECKOUT_TOOLS
+    | ACCOUNT_TOOLS
 )
 
 FORBIDDEN_ARGUMENTS = {
@@ -114,7 +124,10 @@ async def test_exactly_one_tool_can_spend_a_wallet_balance(settings: Settings) -
         await components.aclose()
 
     names = {tool.name for tool in tools}
-    added = names - AUTHENTICATION_TOOLS - CATALOG_TOOLS - PURCHASE_PREPARATION_TOOLS - CARD_CHECKOUT_TOOLS
+    added = (
+        names - AUTHENTICATION_TOOLS - CATALOG_TOOLS - PURCHASE_PREPARATION_TOOLS - CARD_CHECKOUT_TOOLS
+        - ACCOUNT_TOOLS
+    )
     assert added == PURCHASE_EXECUTION_TOOLS
     assert len(added) == 1
 
@@ -128,7 +141,10 @@ async def test_exactly_two_card_tools_were_added(settings: Settings) -> None:
         await components.aclose()
 
     names = {tool.name for tool in tools}
-    added = names - AUTHENTICATION_TOOLS - CATALOG_TOOLS - PURCHASE_PREPARATION_TOOLS - PURCHASE_EXECUTION_TOOLS
+    added = (
+        names - AUTHENTICATION_TOOLS - CATALOG_TOOLS - PURCHASE_PREPARATION_TOOLS - PURCHASE_EXECUTION_TOOLS
+        - ACCOUNT_TOOLS
+    )
     assert added == CARD_CHECKOUT_TOOLS
     assert len(added) == 2
 

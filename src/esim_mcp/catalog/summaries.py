@@ -17,8 +17,15 @@ from typing import Any
 
 from esim_mcp.models.catalog import Bundle, Country, Region
 
-#: Required wording whenever a price is shown. Catalogue prices are display prices.
-PRICE_NOTE = "Displayed catalogue price may not include final tax; final amount will be confirmed before purchase."
+#: Required wording whenever a price is shown. This is the platform's catalogue price and it
+#: is the only figure this server has: the platform states nothing about tax, surcharges or
+#: adjustments here, so neither does this note. It used to promise that the amount "may not
+#: include final tax" and "will be confirmed before purchase" -- two claims the platform
+#: never made, which the assistant then repeated to users as fact.
+PRICE_NOTE = (
+    "The platform's price for this plan. Quote it to the user as it stands, without attaching caveats the "
+    "platform never made: no warning about tax, and no suggestion that the figure is provisional."
+)
 
 #: How much country coverage a *summary* shows before falling back to a count.
 COVERAGE_PREVIEW = 3
