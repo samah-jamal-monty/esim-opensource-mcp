@@ -692,6 +692,49 @@ Because the MCP SDK renders a tool error as `str(exception)`, the suggestions an
 are written into the error **message** rather than a structured payload — otherwise the
 model would never see them.
 
+### A region code is sent back exactly as the backend spelled it
+
+`GET /bundles/by-region/{region_code}` selects with `region.region_code == region_code`
+against the same list `GET /bundles/region` returned, and raises `400 "Region Not Found"`
+when nothing matches. The comparison is **case-sensitive**, and region codes originate as
+the upstream hub's zone tag (`EUROPE`, `ASIA`, `GLOBAL`) — upper-case by convention, not by
+contract.
+
+`Region` therefore exposes two codes, and they are not interchangeable:
+
+| Property | Value | Used for |
+| --- | --- | --- |
+| `Region.api_code` | the backend's spelling, untouched | the URL path — the only one that may go on the wire |
+| `Region.code` | `api_code` upper-cased | display in a tool result, and matching a user's wording |
+
+Matching a user's wording is case-insensitive either way, so a model that passes back the
+upper-cased `region_code` it was shown still resolves to the right region, and the search
+still goes out under the backend's own spelling.
+
+This was a live defect: `find_bundles_by_region` sent `Region.code`, so any region whose
+code was not already upper-case was listed happily by `list_regions` and then rejected by
+`/bundles/by-region` — which the assistant reported to the user as "no plans for that
+region". `tests/test_catalog_tools.py::test_a_region_is_searched_by_the_code_the_backend_gave_not_an_upper_cased_one`
+stubs both spellings and fails if it ever comes back.
+
+### The by-region route has no pagination
+
+`GET /bundles/by-region/{region_code}` declares no `page`, `limit`, `offset` or `size`
+parameter — its only inputs are the path code and the `X-Device-Id` / `Accept-Language` /
+`X-Currency` headers, and the whole list comes back in one response. The client sends no
+paging parameter, and there is never a second page to fetch. Bounding the *result* is this
+server's own job (see [Result sizes](#result-sizes)), not the backend's.
+
+### An error is never an empty catalogue
+
+A failed region search raises a typed error; only a `200` with `data: []` produces an empty
+result. `401`/`403` → `authentication_required`, `429` → `rate_limited`, `400`/`404` →
+`region_not_found`, `5xx` → `catalog_unavailable`. The `region_not_found` raised by the
+*client* (as opposed to the resolver) means the backend rejected a code that came out of its
+own region list, so its message says explicitly that this is not a statement that the region
+has no plans. The server instructions and the tool description repeat the rule: say a
+destination has no plans only when a search returned successfully and said so.
+
 ## Result sizes
 
 A destination can carry dozens of bundles and the catalogue has hundreds of countries, so

@@ -67,6 +67,8 @@ def bundle_summary(bundle: Bundle) -> dict[str, Any]:
         summary["price_amount"] = bundle.price
     if bundle.currency_code:
         summary["currency"] = bundle.currency_code
+    if bundle.plan_type:
+        summary["plan_type"] = bundle.plan_type
     coverage = _coverage(bundle, preview=COVERAGE_PREVIEW)
     if coverage:
         summary["coverage"] = coverage

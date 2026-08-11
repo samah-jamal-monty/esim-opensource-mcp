@@ -113,6 +113,115 @@ async def test_every_optional_argument_is_wired_through(server: MCPServer, respx
     assert request.headers["X-Currency"] == "EUR"
 
 
+async def test_region_search_works_end_to_end_through_the_tool_interface(
+    server: MCPServer, respx_mock: respx.Router
+) -> None:
+    """ "Show bundles for Europe", all the way through the registered tool.
+
+    Two backend calls, in order: the region list to resolve the name, then
+    ``/bundles/by-region/{region_code}`` with the code that list gave back.
+    """
+    regions = respx_mock.get(f"{API_URL}/bundles/region").mock(
+        return_value=httpx.Response(200, json=envelope(CATALOG_REGIONS))
+    )
+    bundles = respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(
+            200,
+            json=envelope(
+                [
+                    bundle_payload(bundle_code="eur-3gb", gprs_limit=3.0, price=9.0, validity=15),
+                    bundle_payload(bundle_code="eur-10gb", gprs_limit=10.0, price=19.0, validity=30),
+                ]
+            ),
+        )
+    )
+
+    result = await server.call_tool("find_bundles_by_region", {"region": "Europe"})
+
+    assert result.is_error is not True
+    body = payload_of(result)
+    assert regions.called
+    assert bundles.called
+    assert body["status"] == "ok"
+    assert body["region"] == {"region_name": "Europe", "region_code": "EUR"}
+    assert [bundle["bundle_code"] for bundle in body["bundles"]] == ["eur-3gb", "eur-10gb"]
+    assert body["price_note"]
+
+
+async def test_region_search_passes_its_filters_and_currency_through_the_binding(
+    server: MCPServer, respx_mock: respx.Router
+) -> None:
+    """Every declared argument has to survive the schema and reach the service."""
+    respx_mock.get(f"{API_URL}/bundles/region").mock(return_value=httpx.Response(200, json=envelope(CATALOG_REGIONS)))
+    route = respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(
+            200,
+            json=envelope(
+                [
+                    bundle_payload(bundle_code="small", gprs_limit=1.0, price=4.0, validity=7),
+                    bundle_payload(bundle_code="large", gprs_limit=20.0, price=25.0, validity=30),
+                ]
+            ),
+        )
+    )
+
+    body = payload_of(
+        await server.call_tool(
+            "find_bundles_by_region",
+            {
+                "region": "EUR",
+                "minimum_data_gb": 5,
+                "minimum_validity_days": 14,
+                "sort_by": "price",
+                "limit": 3,
+                "locale": "fr",
+                "currency": "eur",
+            },
+        )
+    )
+
+    assert [bundle["bundle_code"] for bundle in body["bundles"]] == ["large"]
+    assert body["filters_applied"]
+    request = route.calls.last.request
+    assert request.headers["Accept-Language"] == "fr"
+    assert request.headers["X-Currency"] == "EUR"
+
+
+async def test_a_region_with_no_plans_comes_back_as_a_successful_empty_result(
+    server: MCPServer, respx_mock: respx.Router
+) -> None:
+    """An empty catalogue for a region is a success, not a tool error."""
+    respx_mock.get(f"{API_URL}/bundles/region").mock(return_value=httpx.Response(200, json=envelope(CATALOG_REGIONS)))
+    respx_mock.get(f"{API_URL}/bundles/by-region/MEA").mock(
+        return_value=httpx.Response(200, json=envelope([], total_count=0))
+    )
+
+    result = await server.call_tool("find_bundles_by_region", {"region": "Middle East"})
+
+    assert result.is_error is not True
+    body = payload_of(result)
+    assert body["bundles"] == []
+    assert body["total_count"] == 0
+    assert "sells no plans" in body["note"]
+
+
+async def test_a_region_backend_failure_reaches_the_client_as_an_error_not_an_empty_list(
+    server: MCPServer, respx_mock: respx.Router
+) -> None:
+    """The failure has to stay a failure across the MCP error channel."""
+    respx_mock.get(f"{API_URL}/bundles/region").mock(return_value=httpx.Response(200, json=envelope(CATALOG_REGIONS)))
+    respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(500, json=envelope(None, status="failed", title="Exception", response_code=500))
+    )
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("find_bundles_by_region", {"region": "Europe"})
+
+    rendered = str(excinfo.value)
+    assert "catalog_unavailable" in rendered
+    assert "Traceback" not in rendered
+
+
 async def test_bundle_details_work_through_the_tool_interface(server: MCPServer, respx_mock: respx.Router) -> None:
     respx_mock.get(f"{API_URL}/bundles/{BUNDLE_CODE}").mock(
         return_value=httpx.Response(200, json=envelope(bundle_payload()))

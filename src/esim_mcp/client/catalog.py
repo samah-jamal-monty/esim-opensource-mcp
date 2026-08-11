@@ -114,7 +114,14 @@ class CatalogApiClient:
         locale: str,
         currency: str,
     ) -> list[Bundle]:
-        """``GET /bundles/by-region/{region_code}`` -- e.g. ``EUR``."""
+        """``GET /bundles/by-region/{region_code}`` -- the whole list, no pagination.
+
+        The backend takes the code in the **path**, matches it against its own region list
+        with case-sensitive equality, and returns every surviving bundle in one response:
+        the route declares no ``page``, ``limit``, ``offset`` or ``size`` parameter, so this
+        call sends none and there is never a second page to fetch. Pass the region's
+        :attr:`~esim_mcp.models.catalog.Region.api_code`, never a re-cased copy of it.
+        """
         code = _require_identifier(region_code, "region")
         try:
             data = await self._get(
@@ -124,8 +131,15 @@ class CatalogApiClient:
                 currency=currency,
             )
         except InvalidInputError:
-            # The backend answers 400 "Region Not Found" for an unknown code.
-            raise RegionNotFoundError() from None
+            # The backend answers 400 "Region Not Found" for a code its own region list does
+            # not contain. Reaching this means the code came back from `/bundles/region` and
+            # was then rejected -- a contract mismatch, not a user naming a place that does
+            # not exist, and above all not evidence that the region has no plans.
+            raise RegionNotFoundError(
+                "The platform lists that region but did not accept its region code, so its plans could not be "
+                "read. This is not a statement that the region has no plans -- never tell the user there are "
+                "none. Show the region list again and ask the user to pick one."
+            ) from None
         return parse_bundles(data)
 
     async def get_bundle_details(

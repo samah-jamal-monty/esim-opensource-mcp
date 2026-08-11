@@ -6,6 +6,7 @@ from esim_mcp.session.identity import (
     ClientIdentityProvider,
     DevelopmentIdentityProvider,
     ResolvingClientIdentityProvider,
+    TransportSessionIdentityProvider,
     build_identity_provider,
     derive_device_id,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "ResolvingClientIdentityProvider",
     "SessionManager",
     "SessionStore",
+    "TransportSessionIdentityProvider",
     "UserSession",
     "build_identity_provider",
     "derive_device_id",

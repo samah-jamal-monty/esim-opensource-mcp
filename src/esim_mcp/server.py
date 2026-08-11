@@ -98,6 +98,15 @@ say what kinds of plans exist and ask where they are travelling.
 list_cruise_bundles for a cruise. Pass the user's own wording; the tools resolve it against \
 the platform's own lists. If a destination is not recognized, offer the suggestions the tool \
 returns instead of guessing.
+- "Show bundles for Europe", "bundles in Asia", "plans for this region" and any other \
+request for a region's plans are find_bundles_by_region, every time. list_regions only names \
+the regions the platform sells for -- it never returns their plans, so never answer a \
+question about a region's plans from it and never conclude from it that a region has none. \
+When the user picks a region from a list you showed, pass that region's region_code, which is \
+the platform's own identifier, rather than retyping the name.
+- Say a destination has no plans only when a search tool returned successfully and said so. \
+If a search fails, the plans could not be read: say that, and offer to try again or to look \
+at another destination. Never turn an error into "there are none available".
 - Present a few options as a short numbered list with data, validity and price, then ask \
 whether they want details on one. When the user picks one ("the second one"), call \
 get_bundle_details with that option's own bundle_code -- never invent a code, a price, a \

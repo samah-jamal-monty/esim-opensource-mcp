@@ -263,7 +263,9 @@ class CatalogService:
             "returned_count": min(size, len(selected)),
             "regions": [region_summary(region) for region in selected[:size]],
             "note": (
-                "Use find_bundles_by_region with one of these regions to see its plans."
+                "Names only -- this result carries no plans. Call find_bundles_by_region with one of these "
+                "region_code values to see a region's plans, and never say a region has none on the strength "
+                "of this list."
                 if match != "none"
                 else "No region matched. These are the regions the platform actually sells; ask the user to pick one."
             ),
@@ -391,8 +393,18 @@ class CatalogService:
             parse_sort_key(sort_by)
 
         resolved = await self._regions.resolve(region, device_id=device_id, locale=locale_value)
+        # The backend compares region codes with `==`, so what goes in the path has to be the
+        # code it gave us, not the upper-cased one shown to the model. Sending `resolved.code`
+        # here made every region whose code is not already upper-case answer 400 "Region Not
+        # Found", which the assistant then reported to the user as "no plans for that region".
+        code = resolved.api_code
+        if not code:
+            raise NoMatchingBundlesError(
+                f"The catalogue lists {resolved.name} but gives no region code for it, so its plans cannot be "
+                "looked up. This does not mean it has no plans -- offer another region or a single country."
+            )
         bundles = await self._client.list_bundles_by_region_code(
-            resolved.code or resolved.region_code,
+            code,
             device_id=device_id,
             locale=locale_value,
             currency=currency_value,
@@ -585,9 +597,16 @@ def register_catalog_tools(server: MCPServer, service: CatalogService) -> None:
         title="List eSIM regions",
         description=(
             "List the regions the eSIM platform sells multi-country plans for, such as Europe.\n"
-            "WHEN: the user mentions a region, asks what regional plans exist, or is travelling "
-            "to several countries in one area.\n"
-            "Use a region from this result with find_bundles_by_region. This needs no login."
+            "WHEN: the user asks which regions exist, or you need to check that a region the user "
+            "named is one the platform actually sells for.\n"
+            "IMPORTANT: this returns region NAMES AND CODES ONLY -- it never returns a region's "
+            "plans, and an empty or short list here says nothing about how many plans a region "
+            'has. To show a region\'s plans ("show bundles for Europe", "bundles in Asia", "plans '
+            'for this region") call find_bundles_by_region. Never answer a question about a '
+            "region's plans from this result, and never conclude from it that a region has none.\n"
+            "Pass each region on to find_bundles_by_region by its region_code from this result "
+            "when you have it; it is the platform's own stable identifier and is safer than a "
+            "name. This needs no login."
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
     )
@@ -679,11 +698,19 @@ def register_catalog_tools(server: MCPServer, service: CatalogService) -> None:
         title="Find eSIM plans for a region",
         description=(
             "Find the multi-country eSIM plans available for one region, such as Europe.\n"
-            "WHEN: the user names a region, or is visiting several countries in the same area.\n"
-            "Pass the region as the user said it (name or code); this tool resolves it against the "
-            "platform's own region list. Filters and presentation work exactly as in "
-            "find_bundles_by_country: only pass filters the user stated, then offer a short "
+            'WHEN: the user asks for a region\'s plans -- "show bundles for Europe", "bundles in '
+            'Asia", "plans for this region", "what do you have for the Middle East" -- or names a '
+            "region, or is visiting several countries in the same area. This is the ONLY tool that "
+            "returns a region's plans; list_regions just names the regions.\n"
+            "Prefer the region_code from a list_regions or browse_home_catalog result, which is "
+            "the platform's own stable identifier. Otherwise pass the region name as the user said "
+            "it and this tool resolves it against the platform's own region list -- it never "
+            "guesses between two similar regions, it asks. Filters and presentation work exactly "
+            "as in find_bundles_by_country: only pass filters the user stated, then offer a short "
             "numbered list and keep each bundle_code for follow-up.\n"
+            "AFTER FAILURE: an error here means the plans could not be read, NOT that the region "
+            "has none. Only say a region has no plans when this tool returns successfully with an "
+            "empty list and says so.\n"
             "The result covers this region only. This needs no login."
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),

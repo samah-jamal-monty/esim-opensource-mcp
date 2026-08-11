@@ -173,7 +173,9 @@ def test_instructions_forbid_asking_for_secrets() -> None:
 
 
 #: snake_case words in the instructions that are argument names, not tool names.
-KNOWN_NON_TOOL_TERMS = {"bundle_code"}
+#: Result *field* names the instructions may legitimately mention. Everything else that
+#: looks like a tool name has to be one.
+KNOWN_NON_TOOL_TERMS = {"bundle_code", "region_code"}
 
 
 def test_instructions_reference_only_tools_that_exist(tools: list[Tool]) -> None:
@@ -297,7 +299,17 @@ def test_every_tool_has_a_human_title_and_substantial_description(tools: list[To
             "list_countries",
             ["when:", "needs no login", "do not read the whole", "ask the user where they are travelling"],
         ),
-        ("list_regions", ["when:", "needs no login", "find_bundles_by_region"]),
+        (
+            "list_regions",
+            [
+                "when:",
+                "needs no login",
+                "find_bundles_by_region",
+                "region names and codes only",
+                "never returns a region's plans",
+                "never conclude from it that a region has none",
+            ],
+        ),
         (
             "browse_home_catalog",
             ["show me all bundles", "never claim to be showing all of them", "ask which country or region"],
@@ -315,7 +327,19 @@ def test_every_tool_has_a_human_title_and_substantial_description(tools: list[To
                 "never describe it as the platform's whole",
             ],
         ),
-        ("find_bundles_by_region", ["when:", "only pass filters the user stated", "needs no login"]),
+        (
+            "find_bundles_by_region",
+            [
+                "when:",
+                "only pass filters the user stated",
+                "needs no login",
+                "show bundles for europe",
+                "bundles in asia",
+                "plans for this region",
+                "the only tool that returns a region's plans",
+                "not that the region has none",
+            ],
+        ),
         ("list_cruise_bundles", ["when:", "cruise", "before promising coverage", "needs no login"]),
         (
             "get_bundle_details",
@@ -518,6 +542,53 @@ def test_catalogue_arguments_tell_the_model_where_the_value_comes_from(tools: li
     bundle_code = named["get_bundle_details"].input_schema["properties"]["bundle_code"]
     assert "already received" in bundle_code["description"].lower()
     assert "never invent" in bundle_code["description"].lower()
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "show bundles for europe",
+        "bundles in asia",
+        "plans for this region",
+    ],
+)
+def test_the_instructions_route_a_regions_plans_to_the_region_search(phrase: str) -> None:
+    """The reported failure was a routing failure: these asks have to name one tool.
+
+    The assistant listed the regions, then answered "no bundles available" because nothing
+    told it that a region's plans live behind a different tool.
+    """
+    instructions = SERVER_INSTRUCTIONS.lower()
+
+    assert phrase in instructions
+    sentence = next(part for part in instructions.split(".") if phrase in part)
+    assert "find_bundles_by_region" in sentence
+
+
+def test_the_instructions_deny_that_the_region_list_carries_plans() -> None:
+    instructions = SERVER_INSTRUCTIONS.lower()
+
+    assert "list_regions only names the regions" in instructions
+    assert "never returns their plans" in instructions
+    assert "never conclude from it that a region has none" in instructions
+
+
+def test_the_instructions_forbid_turning_a_failed_search_into_an_empty_catalogue() -> None:
+    """Requirement: a backend error is never reported to the user as "there are none"."""
+    instructions = SERVER_INSTRUCTIONS.lower()
+
+    assert 'never turn an error into "there are none available"' in instructions
+    assert "only when a search tool returned successfully and said so" in instructions
+
+
+def test_the_region_search_is_registered_read_only(tools: list[Tool]) -> None:
+    """A catalogue tool that could be taken for a mutation would be a contract break."""
+    region_search = by_name(tools)["find_bundles_by_region"]
+
+    assert region_search.annotations is not None
+    assert region_search.annotations.read_only_hint is True
+    assert region_search.annotations.destructive_hint is False
+    assert region_search.annotations.idempotent_hint is True
 
 
 def test_bundle_limits_are_documented_where_the_model_reads_them(tools: list[Tool]) -> None:

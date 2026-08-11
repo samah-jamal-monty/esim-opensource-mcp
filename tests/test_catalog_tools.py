@@ -10,9 +10,14 @@ import respx
 
 from esim_mcp.catalog.summaries import PRICE_NOTE
 from esim_mcp.errors import (
+    AmbiguousRegionError,
+    AuthenticationRequiredError,
+    CatalogUnavailableError,
     CountryNotFoundError,
+    EsimMcpError,
     InvalidInputError,
     NoMatchingBundlesError,
+    RateLimitedError,
     RegionNotFoundError,
 )
 from esim_mcp.tools.catalog import CatalogService
@@ -25,6 +30,7 @@ from tests.conftest import (
     country_payload,
     envelope,
     home_payload,
+    region_payload,
 )
 
 BUNDLE_CODE = "aaaaaaaa-0000-4000-8000-000000000001"
@@ -499,6 +505,243 @@ async def test_an_unknown_region_never_reaches_the_bundle_route(
         await catalog_service.find_bundles_by_region(region="Scandinavia")
 
     assert route.call_count == 0
+
+
+async def test_a_region_is_searched_by_the_code_the_backend_gave_not_an_upper_cased_one(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """Regression: a mixed-case region code used to be upper-cased on its way into the URL.
+
+    ``/bundles/region`` had listed the region happily, so the assistant could name it -- but
+    ``/bundles/by-region/{region_code}`` compares with ``==``, saw ``NORDICS`` where its own
+    list says ``Nordics``, and answered 400 "Region Not Found". The assistant then told the
+    user the region had no plans. Both routes are stubbed here; only the correctly-cased one
+    returns bundles, so an upper-casing regression fails this test rather than a user.
+    """
+    respx_mock.get(f"{API_URL}/bundles/region").mock(
+        return_value=httpx.Response(
+            200, json=envelope([region_payload(region_code="Nordics", region_name="Nordics", guid="g-nordics")])
+        )
+    )
+    wrong_case = respx_mock.get(f"{API_URL}/bundles/by-region/NORDICS").mock(
+        return_value=httpx.Response(
+            400, json=envelope(None, status="failed", title="Request failed.", response_code=400)
+        )
+    )
+    correct_case = respx_mock.get(f"{API_URL}/bundles/by-region/Nordics").mock(
+        return_value=httpx.Response(200, json=envelope(FRANCE_BUNDLES))
+    )
+
+    result = await catalog_service.find_bundles_by_region(region="Nordics")
+
+    assert correct_case.called
+    assert wrong_case.call_count == 0
+    assert result["total_count"] == len(FRANCE_BUNDLES)
+    assert result["region"] == {"region_name": "Nordics", "region_code": "NORDICS"}
+
+
+async def test_a_region_can_be_searched_by_the_region_code_from_the_region_list(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """The stable identifier the model is told to prefer has to actually work as input."""
+    mock_regions(respx_mock)
+    route = respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(200, json=envelope(FRANCE_BUNDLES))
+    )
+
+    result = await catalog_service.find_bundles_by_region(region="EUR")
+
+    assert route.called
+    assert result["region"] == {"region_name": "Europe", "region_code": "EUR"}
+
+
+async def test_a_region_the_platform_genuinely_has_no_plans_for_says_so_plainly(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """An empty result is only ever reported when the backend really returned nothing."""
+    mock_regions(respx_mock)
+    respx_mock.get(f"{API_URL}/bundles/by-region/MEA").mock(
+        return_value=httpx.Response(200, json=envelope([], total_count=0))
+    )
+
+    result = await catalog_service.find_bundles_by_region(region="Middle East")
+
+    assert result["status"] == "ok"
+    assert result["bundles"] == []
+    assert result["total_count"] == 0
+    assert result["returned_count"] == 0
+    assert "currently sells no plans for Middle East" in result["note"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (401, AuthenticationRequiredError),
+        (403, AuthenticationRequiredError),
+        (404, RegionNotFoundError),
+        (429, RateLimitedError),
+        (500, CatalogUnavailableError),
+    ],
+)
+async def test_a_failing_region_search_raises_instead_of_reporting_an_empty_region(
+    catalog_service: CatalogService,
+    respx_mock: respx.Router,
+    status_code: int,
+    expected: type[EsimMcpError],
+) -> None:
+    """Requirement: a backend error must never be rendered as "no bundles available".
+
+    The tool has no success path that can be reached from a failed backend call -- every
+    status raises a typed error, so the model is never handed ``bundles: []`` to explain.
+    """
+    mock_regions(respx_mock)
+    respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(
+            status_code, json=envelope(None, status="failed", title="Failed", response_code=status_code)
+        )
+    )
+
+    with pytest.raises(expected):
+        await catalog_service.find_bundles_by_region(region="Europe")
+
+
+async def test_an_ambiguous_region_name_asks_the_user_instead_of_picking_one(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """Two regions sharing a name are never resolved by guesswork, and never searched."""
+    respx_mock.get(f"{API_URL}/bundles/region").mock(
+        return_value=httpx.Response(
+            200,
+            json=envelope(
+                [
+                    region_payload(region_code="EU1", region_name="Europe", guid="g1"),
+                    region_payload(region_code="EU2", region_name="Europe", guid="g2"),
+                ]
+            ),
+        )
+    )
+    first = respx_mock.get(f"{API_URL}/bundles/by-region/EU1").mock(
+        return_value=httpx.Response(200, json=envelope(FRANCE_BUNDLES))
+    )
+    second = respx_mock.get(f"{API_URL}/bundles/by-region/EU2").mock(
+        return_value=httpx.Response(200, json=envelope(FRANCE_BUNDLES))
+    )
+
+    with pytest.raises(AmbiguousRegionError) as excinfo:
+        await catalog_service.find_bundles_by_region(region="Europe")
+
+    assert first.call_count == 0
+    assert second.call_count == 0
+    assert "which one they mean" in str(excinfo.value)
+
+
+async def test_an_ambiguous_region_is_resolved_once_the_user_gives_its_code(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """The way out of the ambiguity is the stable code, not a better guess at the name."""
+    respx_mock.get(f"{API_URL}/bundles/region").mock(
+        return_value=httpx.Response(
+            200,
+            json=envelope(
+                [
+                    region_payload(region_code="EU1", region_name="Europe", guid="g1"),
+                    region_payload(region_code="EU2", region_name="Europe", guid="g2"),
+                ]
+            ),
+        )
+    )
+    route = respx_mock.get(f"{API_URL}/bundles/by-region/EU2").mock(
+        return_value=httpx.Response(200, json=envelope(FRANCE_BUNDLES))
+    )
+
+    result = await catalog_service.find_bundles_by_region(region="EU2")
+
+    assert route.called
+    assert result["region"]["region_code"] == "EU2"
+
+
+async def test_the_region_list_never_claims_to_carry_a_regions_plans(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """list_regions is a name list. Its note must send the model to the search tool."""
+    mock_regions(respx_mock)
+
+    result = await catalog_service.list_regions()
+
+    assert "carries no plans" in result["note"]
+    assert "find_bundles_by_region" in result["note"]
+
+
+async def test_a_region_search_reports_the_fields_the_backend_returned(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """Only backend-sourced values reach the model: code, name, data, validity, price,
+    currency, plan type and coverage."""
+    mock_regions(respx_mock)
+    respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(
+            200,
+            json=envelope(
+                [
+                    bundle_payload(
+                        bundle_code="eur-5gb",
+                        gprs_limit=5.0,
+                        price=12.5,
+                        validity=30,
+                        countries=[country_payload(), country_payload(country="Germany", country_code="DE")],
+                    )
+                ]
+            ),
+        )
+    )
+
+    bundle = (await catalog_service.find_bundles_by_region(region="Europe"))["bundles"][0]
+
+    assert bundle["bundle_code"] == "eur-5gb"
+    assert bundle["name"]
+    assert bundle["data"] == "5.0 GB"
+    assert bundle["validity"] == "30 Day"
+    assert bundle["price_amount"] == 12.5
+    assert bundle["currency"] == "USD"
+    assert bundle["plan_type"] == "Data only"
+    assert bundle["coverage"]["countries_count"] == 2
+    assert bundle["coverage"]["countries"] == ["France", "Germany"]
+
+
+async def test_a_bundle_summary_omits_a_plan_type_the_backend_did_not_supply(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """Omitted rather than defaulted: the model can never read out a value nobody sent."""
+    mock_regions(respx_mock)
+    payload = bundle_payload(bundle_code="eur-5gb")
+    payload.pop("plan_type")
+    respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(return_value=httpx.Response(200, json=envelope([payload])))
+
+    bundle = (await catalog_service.find_bundles_by_region(region="Europe"))["bundles"][0]
+
+    assert "plan_type" not in bundle
+
+
+async def test_a_region_search_drops_the_bundles_the_backend_marks_inactive(
+    catalog_service: CatalogService, respx_mock: respx.Router
+) -> None:
+    """ "Available and active" is the backend's own is_active flag, never a guess."""
+    mock_regions(respx_mock)
+    respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(
+            200,
+            json=envelope(
+                [
+                    bundle_payload(bundle_code="live", price=10.0),
+                    bundle_payload(bundle_code="retired", price=11.0, is_active=False),
+                ]
+            ),
+        )
+    )
+
+    result = await catalog_service.find_bundles_by_region(region="Europe")
+
+    assert [bundle["bundle_code"] for bundle in result["bundles"]] == ["live"]
 
 
 # ------------------------------------------------------------------ list_cruise_bundles

@@ -17,6 +17,7 @@ from esim_mcp.session.identity import (
     ClientIdentity,
     DevelopmentIdentityProvider,
     ResolvingClientIdentityProvider,
+    build_identity_provider,
     derive_device_id,
 )
 from esim_mcp.session.manager import SessionManager
@@ -64,6 +65,43 @@ def test_session_keys_are_isolated_and_non_reversible() -> None:
     assert "client-a" not in repr(a)
 
 
+class _FakeHeaders(dict):
+    """Case-insensitive enough for the one lookup identity performs."""
+
+    def get(self, key: str, default: object = None) -> object:  # type: ignore[override]
+        return super().get(key.lower(), default)
+
+
+class _FakeContext:
+    """Stands in for an MCP ``Context`` on the Streamable HTTP transport.
+
+    Identity reads exactly one thing from it: the ``mcp-session-id`` the SDK assigned to
+    this connection and routed this request by.
+    """
+
+    def __init__(self, session_id: str | None = "session-a") -> None:
+        self.headers = _FakeHeaders({"mcp-session-id": session_id} if session_id else {})
+        self.request_context = None
+
+
+def _http_settings(environment: str = "qa") -> Settings:
+    return Settings.build(
+        api_base_url="https://backend.test",
+        environment=environment,
+        transport="streamable-http",
+        device_id_salt=TEST_SALT,
+    )
+
+
+def _stdio_settings(environment: str = "qa") -> Settings:
+    return Settings.build(
+        api_base_url="https://backend.test",
+        environment=environment,
+        transport="stdio",
+        device_id_salt=TEST_SALT,
+    )
+
+
 async def test_authenticated_provider_fails_closed_without_a_principal() -> None:
     with pytest.raises(IdentityUnavailableError):
         await AuthenticatedTransportIdentityProvider().resolve(None)
@@ -79,14 +117,107 @@ async def test_production_never_falls_back_to_the_development_identity() -> None
         await ResolvingClientIdentityProvider(settings).resolve(None)
 
 
-async def test_development_identity_is_stable_outside_production(settings: Settings) -> None:
+@pytest.mark.parametrize("environment", ["local", "development", "qa", "staging", "production"])
+async def test_http_never_resolves_an_identity_without_a_session_id(environment: str) -> None:
+    """The regression this file exists to prevent, asserted for every environment.
+
+    This previously asserted the opposite -- that two calls with no context resolve to the
+    *same* stable identity. That was the bug: over Streamable HTTP it meant every connected
+    user shared one session key, one stored session and one bearer token, so user B was
+    signed in as user A. An HTTP call that carries no session id is now refused.
+    """
+    provider = ResolvingClientIdentityProvider(_http_settings(environment))
+
+    with pytest.raises(IdentityUnavailableError):
+        await provider.resolve(None)
+    with pytest.raises(IdentityUnavailableError):
+        await provider.resolve(_FakeContext(session_id=None))
+    with pytest.raises(IdentityUnavailableError):
+        await provider.resolve(_FakeContext(session_id="   "))
+
+
+@pytest.mark.parametrize("environment", ["local", "development", "qa", "staging"])
+async def test_a_process_identity_is_unreachable_once_a_request_is_in_context(environment: str) -> None:
+    """The structural half of the fix.
+
+    Even with ``ESIM_MCP_TRANSPORT`` misconfigured as stdio, a call that arrived over HTTP
+    can never reach a per-process identity -- so a configuration mistake cannot reintroduce
+    a shared session on a multiplexed transport.
+    """
+    provider = ResolvingClientIdentityProvider(_stdio_settings(environment))
+
+    with pytest.raises(IdentityUnavailableError):
+        await provider.resolve(_FakeContext(session_id=None))
+
+
+async def test_the_shipped_provider_never_constructs_the_constant_identity() -> None:
+    """``build_identity_provider`` must not be able to produce a shared principal."""
+    provider = build_identity_provider(_http_settings())
+
+    assert isinstance(provider, ResolvingClientIdentityProvider)
+    for attribute in vars(provider).values():
+        assert not isinstance(attribute, DevelopmentIdentityProvider), (
+            "the shipped resolver still wires in the constant development identity"
+        )
+
+
+async def test_two_connections_resolve_to_two_different_identities() -> None:
+    """The core isolation property, at the identity layer."""
+    settings = _http_settings()
     provider = ResolvingClientIdentityProvider(settings)
 
-    first = await provider.resolve(None)
-    second = await provider.resolve(None)
+    identity_a = await provider.resolve(_FakeContext("session-a"))
+    identity_b = await provider.resolve(_FakeContext("session-b"))
+
+    assert identity_a.session_key != identity_b.session_key
+    assert derive_device_id(settings.salt_bytes(), identity_a) != derive_device_id(
+        settings.salt_bytes(), identity_b
+    )
+
+
+async def test_one_connection_keeps_one_identity_across_calls() -> None:
+    """Stable *within* a connection, so a signed-in user stays signed in while connected.
+
+    The SDK rebuilds its ``ServerSession`` object per request, so this property is exactly
+    why identity keys on the session id rather than on that object.
+    """
+    provider = ResolvingClientIdentityProvider(_http_settings())
+
+    first = await provider.resolve(_FakeContext("session-a"))
+    second = await provider.resolve(_FakeContext("session-a"))
 
     assert first.session_key == second.session_key
-    assert derive_device_id(settings.salt_bytes(), first) == derive_device_id(settings.salt_bytes(), second)
+
+
+async def test_the_session_id_is_never_recoverable_from_the_stored_key() -> None:
+    """The routing credential is hashed into the storage key, never stored as itself."""
+    identity = (await ResolvingClientIdentityProvider(_http_settings()).resolve(_FakeContext("secret-id")))
+
+    assert "secret-id" not in identity.session_key
+    assert "secret-id" not in repr(identity)
+
+
+async def test_a_stdio_process_identity_is_random_per_process() -> None:
+    """Two stdio processes are never the same caller, even with identical configuration."""
+    settings = _stdio_settings()
+
+    first = await ResolvingClientIdentityProvider(settings).resolve(None)
+    second = await ResolvingClientIdentityProvider(settings).resolve(None)
+
+    assert first.session_key != second.session_key
+
+
+async def test_a_stdio_identity_is_stable_within_one_process() -> None:
+    provider = ResolvingClientIdentityProvider(_stdio_settings())
+
+    assert (await provider.resolve(None)).session_key == (await provider.resolve(None)).session_key
+
+
+async def test_stdio_identity_is_refused_in_production() -> None:
+    provider = ResolvingClientIdentityProvider(_stdio_settings("production"))
+
+    with pytest.raises(IdentityUnavailableError):
+        await provider.resolve(None)
 
 
 # ---------------------------------------------------------------------------- sessions

@@ -8,11 +8,13 @@ import respx
 
 from esim_mcp.client.catalog import CatalogApiClient
 from esim_mcp.errors import (
+    AuthenticationRequiredError,
     BackendTimeoutError,
     BundleNotFoundError,
     CatalogUnavailableError,
     InvalidBackendResponseError,
     InvalidInputError,
+    RateLimitedError,
     RegionNotFoundError,
 )
 from tests.conftest import (
@@ -87,6 +89,108 @@ async def test_by_region_puts_the_region_code_in_the_path(
 
     assert route.called
     assert len(bundles) == 1
+
+
+async def test_by_region_sends_the_region_code_exactly_as_given(
+    catalog_client: CatalogApiClient, respx_mock: respx.Router
+) -> None:
+    """The backend matches region codes with ``==``, so the client may not re-case one.
+
+    ``bundle_service.get_bundles_by_region`` selects with
+    ``region.region_code == region_code`` and raises 400 "Region Not Found" when nothing
+    matches, so a client that upper-cases a mixed-case code turns a real region into an
+    error.
+    """
+    route = respx_mock.get(f"{API_URL}/bundles/by-region/Nordics").mock(
+        return_value=httpx.Response(200, json=envelope([bundle_payload()]))
+    )
+
+    await catalog_client.list_bundles_by_region_code("Nordics", device_id=DEVICE_ID, locale="en", currency="USD")
+
+    assert route.called
+    assert route.calls.last.request.url.path.endswith("/bundles/by-region/Nordics")
+
+
+async def test_by_region_sends_the_headers_the_route_declares_and_no_pagination(
+    catalog_client: CatalogApiClient, respx_mock: respx.Router
+) -> None:
+    """``GET /bundles/by-region/{region_code}`` declares no paging parameter at all.
+
+    Its only inputs are the path code and the ``x-device-id`` / ``accept-language`` /
+    ``x-currency`` headers; the whole list comes back in one response, so sending a page or
+    limit parameter would be inventing a contract the backend does not have.
+    """
+    route = respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(200, json=envelope([bundle_payload()]))
+    )
+
+    await catalog_client.list_bundles_by_region_code("EUR", device_id=DEVICE_ID, locale="fr", currency="EUR")
+
+    request = route.calls.last.request
+    assert dict(request.url.params) == {}
+    assert request.headers["X-Device-Id"] == DEVICE_ID
+    assert request.headers["Accept-Language"] == "fr"
+    assert request.headers["X-Currency"] == "EUR"
+    assert "Authorization" not in request.headers
+
+
+async def test_a_region_the_backend_rejects_never_reads_as_an_empty_catalogue(
+    catalog_client: CatalogApiClient, respx_mock: respx.Router
+) -> None:
+    """A 400 is an error, and the message must forbid reporting it as "no plans"."""
+    respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(
+            400,
+            json=envelope(None, status="failed", title="Request failed. Please try again.", response_code=400),
+        )
+    )
+
+    with pytest.raises(RegionNotFoundError) as excinfo:
+        await catalog_client.list_bundles_by_region_code("EUR", device_id=DEVICE_ID, locale="en", currency="USD")
+
+    message = str(excinfo.value).lower()
+    assert "never tell the user there are" in message
+    assert "not a statement that the region has no plans" in message
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (401, AuthenticationRequiredError),
+        (403, AuthenticationRequiredError),
+        (404, RegionNotFoundError),
+        (429, RateLimitedError),
+        (500, CatalogUnavailableError),
+    ],
+)
+async def test_a_failing_region_search_always_raises_and_never_returns_no_bundles(
+    catalog_client: CatalogApiClient,
+    respx_mock: respx.Router,
+    status_code: int,
+    expected: type[Exception],
+) -> None:
+    """Every backend failure is an exception. None of them can be mistaken for an empty list."""
+    respx_mock.get(f"{API_URL}/bundles/by-region/EUR").mock(
+        return_value=httpx.Response(
+            status_code, json=envelope(None, status="failed", title="Failed", response_code=status_code)
+        )
+    )
+
+    with pytest.raises(expected):
+        await catalog_client.list_bundles_by_region_code("EUR", device_id=DEVICE_ID, locale="en", currency="USD")
+
+
+async def test_a_region_with_no_bundles_comes_back_as_a_genuine_empty_list(
+    catalog_client: CatalogApiClient, respx_mock: respx.Router
+) -> None:
+    """A valid region with nothing to sell answers 200 with ``data: []``."""
+    respx_mock.get(f"{API_URL}/bundles/by-region/MEA").mock(
+        return_value=httpx.Response(200, json=envelope([], total_count=0))
+    )
+
+    bundles = await catalog_client.list_bundles_by_region_code("MEA", device_id=DEVICE_ID, locale="en", currency="USD")
+
+    assert bundles == []
 
 
 async def test_bundle_details_puts_the_bundle_code_in_the_path(

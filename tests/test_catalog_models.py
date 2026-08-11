@@ -80,6 +80,26 @@ def test_region_code_is_upper_cased_for_comparison() -> None:
     assert region.code == "EUR"
 
 
+def test_the_api_code_keeps_the_backend_spelling_while_code_is_upper_cased() -> None:
+    """``api_code`` is what goes in a URL, so it must survive untouched.
+
+    ``/bundles/by-region/{region_code}`` compares with ``==`` against the very list
+    ``/bundles/region`` returned, so re-casing the code is enough to lose a real region.
+    """
+    region = parse_regions([region_payload(region_code=" Nordics ")])[0]
+
+    assert region.api_code == "Nordics"
+    assert region.code == "NORDICS"
+
+
+def test_a_placeholder_region_code_yields_no_api_code() -> None:
+    """A code the backend could not fill in is never turned into a URL."""
+    region = parse_regions([region_payload(region_code="Unknown")])[0]
+
+    assert region.api_code is None
+    assert region.code is None
+
+
 # -------------------------------------------------------------------------------- bundles
 
 

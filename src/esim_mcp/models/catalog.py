@@ -132,7 +132,22 @@ class Country(BaseModel):
 
 
 class Region(BaseModel):
-    """``RegionDTO``. ``region_code`` (e.g. ``EUR``) is what ``/bundles/by-region`` expects."""
+    """``RegionDTO``. ``region_code`` is what ``/bundles/by-region/{region_code}`` expects.
+
+    Two different codes are exposed on purpose, because they answer two different questions:
+
+    * :attr:`api_code` is the value the *backend* stores, byte for byte. It is the only one
+      that may be put in a URL. ``/bundles/by-region`` matches it with plain ``==`` against
+      the same region list ``/bundles/region`` returns, so any change of case, padding or
+      spelling turns a real region into a 400 "Region Not Found";
+    * :attr:`code` is that value upper-cased for *display and comparison only*. Region codes
+      originate as the upstream hub's zone tag (``EUROPE``, ``ASIA``, ``GLOBAL``), which is
+      conventionally but not contractually upper-case.
+
+    Matching a user's wording is case-insensitive either way, so nothing is lost by keeping
+    the two apart -- and a region the catalogue lists no longer becomes a region whose plans
+    cannot be fetched.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -143,8 +158,13 @@ class Region(BaseModel):
     icon: str | None = None
 
     @property
+    def api_code(self) -> str | None:
+        """The region code exactly as the backend spells it. Never case-folded."""
+        return clean_text(self.region_code)
+
+    @property
     def code(self) -> str | None:
-        code = clean_text(self.region_code)
+        code = self.api_code
         return code.upper() if code else None
 
     @property
