@@ -16,12 +16,17 @@ from esim_mcp.client.auth import AuthApiClient
 from esim_mcp.client.base import BackendApiClient
 from esim_mcp.client.card import CardCheckoutApiClient
 from esim_mcp.client.catalog import CatalogApiClient
+from esim_mcp.client.consumption import ConsumptionApiClient
 from esim_mcp.client.purchase import PurchaseApiClient
+from esim_mcp.client.topup import TopupApiClient
 from esim_mcp.client.wallet import WalletApiClient
+from esim_mcp.client.wallet_topup import WalletTopupApiClient
 from esim_mcp.purchase.card import CardCheckoutService, InMemoryCardCheckoutStore
 from esim_mcp.purchase.execution import InMemoryPurchaseExecutionStore, PurchaseExecutionService
 from esim_mcp.purchase.service import PurchaseQuoteService
 from esim_mcp.purchase.store import InMemoryPurchaseQuoteStore
+from esim_mcp.selection.service import EsimSelectionService
+from esim_mcp.selection.store import InMemoryEsimSelectionStore
 from esim_mcp.session.identity import ClientIdentity, ClientIdentityProvider
 from esim_mcp.session.manager import SessionManager
 from esim_mcp.session.store import InMemorySessionStore
@@ -30,8 +35,23 @@ from esim_mcp.tools.account import AccountService
 from esim_mcp.tools.authentication import AuthenticationService
 from esim_mcp.tools.card_checkout import CardPaymentService
 from esim_mcp.tools.catalog import CatalogService
+from esim_mcp.tools.consumption import ConsumptionService
+from esim_mcp.tools.esim_topup import EsimTopupService
 from esim_mcp.tools.purchase_execution import PurchaseConfirmationService
 from esim_mcp.tools.purchase_preparation import PurchasePreparationService
+from esim_mcp.tools.wallet_topup import WalletTopupService
+from esim_mcp.topup.service import (
+    EsimTopupExecutionService,
+    EsimTopupQuoteService,
+    WalletTopupCheckoutService,
+    WalletTopupQuoteService,
+)
+from esim_mcp.topup.store import (
+    InMemoryEsimTopupExecutionStore,
+    InMemoryEsimTopupQuoteStore,
+    InMemoryWalletTopupCheckoutStore,
+    InMemoryWalletTopupQuoteStore,
+)
 
 BASE_URL = "https://backend.test"
 API_URL = f"{BASE_URL}/api/v1"
@@ -636,10 +656,32 @@ def account_client(backend_client: BackendApiClient) -> AccountApiClient:
 
 
 @pytest.fixture
+def esim_selection_store() -> InMemoryEsimSelectionStore:
+    return InMemoryEsimSelectionStore()
+
+
+@pytest.fixture
+def esim_selection_service(
+    session_manager: SessionManager, esim_selection_store: InMemoryEsimSelectionStore
+) -> EsimSelectionService:
+    """One selection service for the whole graph, wired exactly as build_components wires it.
+
+    Shared rather than per-caller on purpose: a number recorded by get_my_esims has to be the
+    same number get_esim_consumption resolves, and the isolation assertions are only
+    meaningful when both callers look at one store. The invalidation listener is registered
+    here too, so a logout drops the listing in tests exactly as it does in the real server.
+    """
+    service = EsimSelectionService(esim_selection_store)
+    session_manager.add_invalidation_listener(service.invalidate_session)
+    return service
+
+
+@pytest.fixture
 def make_account_service(
     settings: Settings,
     account_client: AccountApiClient,
     session_manager: SessionManager,
+    esim_selection_service: EsimSelectionService,
 ) -> Callable[[ClientIdentityProvider], AccountService]:
     """Build account services for different callers over one shared session manager.
 
@@ -648,7 +690,9 @@ def make_account_service(
     """
 
     def factory(identity_provider: ClientIdentityProvider) -> AccountService:
-        return AccountService(settings, account_client, session_manager, identity_provider)
+        return AccountService(
+            settings, account_client, session_manager, identity_provider, esim_selection_service
+        )
 
     return factory
 
@@ -659,6 +703,457 @@ def account_service(
     identity_a: StubIdentityProvider,
 ) -> AccountService:
     return make_account_service(identity_a)
+
+
+# ------------------------------------------------------------------ purchased eSIM reads
+#
+# Payloads mirror the backend's own contracts field for field: ``EsimBundleResponse`` from
+# ``GET /user/my-esim`` and ``ConsumptionResponse`` from ``GET /user/consumption/{iccid}``,
+# including the epoch-seconds date strings the backend's field validators produce.
+
+#: Two eSIMs on one account, so "which one did you mean" is testable rather than inferred.
+ICCID_A = "8931080019123456789"
+ICCID_B = "8931080019987654321"
+
+#: A third belonging to a *different* account. It must never be reachable from account A.
+ICCID_FOREIGN = "8931080019555555555"
+
+
+def esim_payload(
+    *,
+    iccid: str = ICCID_A,
+    bundle_code: str = "aaaaaaaa-0000-4000-8000-000000000001",
+    label: str | None = "Paris trip",
+    plan_started: bool = True,
+    bundle_expired: bool = False,
+    is_topup_allowed: bool = True,
+    name: str = "France 5GB / 30 Days",
+) -> dict[str, Any]:
+    """A backend ``EsimBundleResponse`` payload, trimmed to the fields this server reads."""
+    return {
+        "is_topup_allowed": is_topup_allowed,
+        "plan_started": plan_started,
+        "bundle_expired": bundle_expired,
+        "label_name": label,
+        "order_number": "ord-0001-aaaa-bbbb",
+        "order_status": "success",
+        "qr_code_value": "LPA:1$smdp.test$ACTIVATION-CODE",
+        "activation_code": "ACTIVATION-CODE",
+        "smdp_address": "smdp.test",
+        "validity_date": "1786000000",
+        "iccid": iccid,
+        "payment_date": "1754472554",
+        "display_title": name,
+        "display_subtitle": f"Stay connected with {name}",
+        "bundle_code": bundle_code,
+        "bundle_marketing_name": name,
+        "bundle_name": name,
+        "count_countries": 1,
+        "currency_code": "USD",
+        "gprs_limit_display": "5.0 GB",
+        "price": 12.5,
+        "price_display": "12.50 USD",
+        "unlimited": False,
+        "validity": 30,
+        "validity_label": "Day",
+        "validity_display": "30 Day",
+        "plan_type": "Data only",
+        "activity_policy": "The validity period starts when the eSIM connects to any supported networks.",
+        "bundle_message": [],
+        "countries": [country_payload()],
+        "supported_ships": [],
+        "icon": "https://cdn.test/media/bundle.png",
+        "transaction_history": [],
+    }
+
+
+def consumption_payload(
+    *,
+    data_allocated: float | str | None = 5.0,
+    data_used: float | str | None = 1.25,
+    data_remaining: float | str | None = 3.75,
+    unit: str = "GB",
+    plan_status: str = "Active",
+    expiry_date: str = "2026-09-10T12:00:00+00:00",
+) -> dict[str, Any]:
+    """A backend ``ConsumptionResponse`` payload, built exactly as ``DtoMapper`` builds it.
+
+    Extended with a ``developerMessage`` and an upstream-looking extra so the "closed field
+    set" property is tested against a payload that contains something worth dropping.
+    """
+    return {
+        "data_allocated": data_allocated,
+        "data_used": data_used,
+        "data_remaining": data_remaining,
+        "data_allocated_display": f"{data_allocated} {unit}",
+        "data_used_display": f"{data_used} {unit}",
+        "data_remaining_display": f"{data_remaining} {unit}",
+        "plan_status": plan_status,
+        "expiry_date": expiry_date,
+        # Not part of the contract. Present so the parser is proved to drop them.
+        "provider_subscriber_id": "sub_secret_0001",
+        "developerMessage": "internal backend detail 0001",
+    }
+
+
+def topup_bundle_payload(
+    *,
+    bundle_code: str = "tttttttt-0000-4000-8000-000000000001",
+    name: str = "France Top-up 3GB / 15 Days",
+    price: float = 6.5,
+    gprs_limit: float = 3.0,
+    validity: int = 15,
+    is_active: bool = True,
+) -> dict[str, Any]:
+    """One compatible top-up, as ``GET /user/related-topup/...`` returns it (a ``BundleDTO``)."""
+    return bundle_payload(
+        bundle_code=bundle_code,
+        name=name,
+        price=price,
+        gprs_limit=gprs_limit,
+        validity=validity,
+        validity_label="Day",
+        is_active=is_active,
+    )
+
+
+@pytest.fixture
+def consumption_client(backend_client: BackendApiClient) -> ConsumptionApiClient:
+    return ConsumptionApiClient(backend_client)
+
+
+@pytest.fixture
+def make_consumption_service(
+    settings: Settings,
+    account_client: AccountApiClient,
+    consumption_client: ConsumptionApiClient,
+    session_manager: SessionManager,
+    esim_selection_service: EsimSelectionService,
+) -> Callable[[ClientIdentityProvider], ConsumptionService]:
+    """Build consumption services for different callers over one shared session manager.
+
+    Sharing the session manager is the point: "one client cannot read another's usage" is
+    only a meaningful assertion when both callers look at the same session store.
+    """
+
+    def factory(identity_provider: ClientIdentityProvider) -> ConsumptionService:
+        return ConsumptionService(
+            settings,
+            account_client,
+            consumption_client,
+            session_manager,
+            identity_provider,
+            esim_selection_service,
+        )
+
+    return factory
+
+
+@pytest.fixture
+def consumption_service(
+    make_consumption_service: Callable[[ClientIdentityProvider], ConsumptionService],
+    identity_a: StubIdentityProvider,
+) -> ConsumptionService:
+    return make_consumption_service(identity_a)
+
+
+# ----------------------------------------------------------------------------- eSIM top-up
+
+
+@pytest.fixture
+def topup_client(backend_client: BackendApiClient) -> TopupApiClient:
+    return TopupApiClient(backend_client)
+
+
+@pytest.fixture
+def esim_topup_quote_store() -> InMemoryEsimTopupQuoteStore:
+    return InMemoryEsimTopupQuoteStore()
+
+
+@pytest.fixture
+def esim_topup_quote_service(
+    settings: Settings, esim_topup_quote_store: InMemoryEsimTopupQuoteStore
+) -> EsimTopupQuoteService:
+    return EsimTopupQuoteService(settings, esim_topup_quote_store)
+
+
+@pytest.fixture
+def esim_topup_execution_store() -> InMemoryEsimTopupExecutionStore:
+    return InMemoryEsimTopupExecutionStore()
+
+
+@pytest.fixture
+def esim_topup_execution_service(
+    esim_topup_execution_store: InMemoryEsimTopupExecutionStore,
+) -> EsimTopupExecutionService:
+    return EsimTopupExecutionService(esim_topup_execution_store)
+
+
+@pytest.fixture
+async def qa_backend_client(qa_topup_settings: Settings) -> AsyncIterator[BackendApiClient]:
+    """A transport built from QA settings, so its route guard admits the QA top-up path.
+
+    Deliberately a second client rather than a mutated one: in the real server the transport
+    and the service read the *same* Settings object, so a test that flipped only the service
+    would be testing a configuration that cannot exist.
+    """
+    client = BackendApiClient(qa_topup_settings)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+@pytest.fixture
+def qa_topup_client(qa_backend_client: BackendApiClient) -> TopupApiClient:
+    return TopupApiClient(qa_backend_client)
+
+
+@pytest.fixture
+def qa_topup_settings() -> Settings:
+    """Settings with the QA eSIM-top-up execution flag ON.
+
+    A separate fixture rather than a mutated ``settings``, so the default everywhere else
+    stays off and any test that reaches execution has to say so out loud.
+    """
+    return Settings.build(
+        api_base_url=BASE_URL,
+        environment="qa",
+        device_id_salt=TEST_SALT,
+        default_locale="en",
+        default_currency="USD",
+        token_refresh_window_seconds=60,
+        login_challenge_ttl_seconds=300,
+        purchase_quote_ttl_seconds=300,
+        max_active_quotes_per_user=5,
+        esim_topup_execution_enabled=True,
+    )
+
+
+@pytest.fixture
+def make_esim_topup_service(
+    settings: Settings,
+    account_client: AccountApiClient,
+    topup_client: TopupApiClient,
+    qa_topup_client: TopupApiClient,
+    wallet_client: WalletApiClient,
+    session_manager: SessionManager,
+    esim_topup_quote_service: EsimTopupQuoteService,
+    esim_topup_execution_service: EsimTopupExecutionService,
+    esim_selection_service: EsimSelectionService,
+) -> Callable[..., EsimTopupService]:
+    """Build top-up services for different callers over one shared set of stores.
+
+    Wired exactly as ``build_components`` wires the real server, including both invalidation
+    listeners: a quote that *names an ICCID*, and the one-attempt lock that stands in for
+    idempotency, must neither outlive the session that made them.
+
+    ``execution_settings`` overrides the settings for callers that need the QA execution flag
+    on. Everything else gets the default, which is off.
+    """
+    session_manager.add_invalidation_listener(esim_topup_quote_service.invalidate_session)
+    session_manager.add_invalidation_listener(esim_topup_execution_service.invalidate_session)
+
+    def factory(
+        identity_provider: ClientIdentityProvider, execution_settings: Settings | None = None
+    ) -> EsimTopupService:
+        # The transport is chosen alongside the settings, exactly as build_components does:
+        # one Settings object governs both the service gate and the route guard.
+        return EsimTopupService(
+            execution_settings or settings,
+            account_client,
+            qa_topup_client if execution_settings is not None else topup_client,
+            wallet_client,
+            session_manager,
+            identity_provider,
+            esim_topup_quote_service,
+            esim_topup_execution_service,
+            esim_selection_service,
+        )
+
+    return factory
+
+
+@pytest.fixture
+def esim_topup_service(
+    make_esim_topup_service: Callable[..., EsimTopupService],
+    identity_a: StubIdentityProvider,
+) -> EsimTopupService:
+    """The default: execution flag OFF, so nothing here can charge anybody."""
+    return make_esim_topup_service(identity_a)
+
+
+@pytest.fixture
+def qa_esim_topup_service(
+    make_esim_topup_service: Callable[..., EsimTopupService],
+    identity_a: StubIdentityProvider,
+    qa_topup_settings: Settings,
+) -> EsimTopupService:
+    """The QA build: execution flag ON. Every test using this one is exercising a write."""
+    return make_esim_topup_service(identity_a, qa_topup_settings)
+
+
+# --------------------------------------------------------------------------- wallet top-up
+#
+# The hosted page lives on a *different* host from the backend on purpose: that is how the
+# real thing works, and a fixture that served the link from the backend host would quietly
+# hide the fact that this server hands a user a third-party address.
+
+TOPUP_CHECKOUT_URL = "https://checkout.test/pay/topup-session-0001"
+TOPUP_PAYMENT_REFERENCE = "topup-ref-0001"
+
+
+def topup_options_payload(
+    *,
+    currency: str = "USD",
+    minimum_amount_exclusive: str = "0.50",
+    maximum_amount: str | None = "100.00",
+    current_balance: str | None = "12.50",
+    can_topup: bool = True,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """The backend's documented top-up options payload, field for field."""
+    return {
+        "currency": currency,
+        "minimum_amount_exclusive": minimum_amount_exclusive,
+        "maximum_amount": maximum_amount,
+        "current_balance": current_balance,
+        "limits": [
+            {"code": "minimum_amount", "value": 0.5, "remaining": None, "unit": "amount"},
+            {"code": "daily_amount", "value": 100.0, "remaining": 100.0, "unit": "amount"},
+            {"code": "daily_count", "value": 2.0, "remaining": 2.0, "unit": "count"},
+        ],
+        "can_topup": can_topup,
+        "fees": [],
+        "message": message,
+    }
+
+
+def wallet_topup_checkout_payload(
+    *,
+    payment_reference: str | None = TOPUP_PAYMENT_REFERENCE,
+    order_id: str | None = "ord-topup-0001",
+    checkout_url: str | None = TOPUP_CHECKOUT_URL,
+    status: str = "PENDING",
+    amount: str | float | None = "25.00",
+    currency: str = "USD",
+    expires_at: str | None = "2026-01-01T00:31:00+00:00",
+    idempotent_replay: bool = False,
+) -> dict[str, Any]:
+    """The backend's documented top-up checkout payload, with non-contract extras.
+
+    The extras are the point: a hosted-checkout payload is exactly the shape of thing that
+    carries a provider session id and a client secret, so the parser is proved to drop them.
+    """
+    return {
+        "payment_reference": payment_reference,
+        "order_id": order_id,
+        "checkout_url": checkout_url,
+        "status": status,
+        "amount": amount,
+        "currency": currency,
+        "expires_at": expires_at,
+        "next_action": "OPEN_CHECKOUT_URL",
+        "idempotent_replay": idempotent_replay,
+        "correlation_id": "c0rr3lat10n",
+        "message": None,
+        "provider_session_id": "sess_secret_value_0001",
+        "provider_client_secret": "secret_do_not_leak_0001",
+        "developerMessage": "internal backend detail 0001",
+    }
+
+
+def wallet_topup_status_payload(
+    *,
+    status: str = "PENDING",
+    payment_reference: str = TOPUP_PAYMENT_REFERENCE,
+    order_id: str | None = "ord-topup-0001",
+    amount: str | float | None = "25.00",
+    currency: str = "USD",
+    expires_at: str | None = "2026-01-01T00:31:00+00:00",
+    paid: bool = False,
+) -> dict[str, Any]:
+    """The backend's documented top-up status payload, with the same non-contract extras."""
+    return {
+        "payment_reference": payment_reference,
+        "status": status,
+        "order_id": order_id,
+        "amount": amount,
+        "currency": currency,
+        "expires_at": expires_at,
+        "paid": paid,
+        "next_action": None,
+        "correlation_id": "c0rr3lat10n",
+        "message": None,
+        "provider_session_id": "sess_secret_value_0001",
+        "developerMessage": "internal backend detail 0001",
+    }
+
+
+@pytest.fixture
+def wallet_topup_client(backend_client: BackendApiClient) -> WalletTopupApiClient:
+    return WalletTopupApiClient(backend_client)
+
+
+@pytest.fixture
+def wallet_topup_quote_store() -> InMemoryWalletTopupQuoteStore:
+    return InMemoryWalletTopupQuoteStore()
+
+
+@pytest.fixture
+def wallet_topup_checkout_store() -> InMemoryWalletTopupCheckoutStore:
+    return InMemoryWalletTopupCheckoutStore()
+
+
+@pytest.fixture
+def wallet_topup_quote_service(
+    settings: Settings, wallet_topup_quote_store: InMemoryWalletTopupQuoteStore
+) -> WalletTopupQuoteService:
+    return WalletTopupQuoteService(settings, wallet_topup_quote_store)
+
+
+@pytest.fixture
+def wallet_topup_checkout_service(
+    wallet_topup_checkout_store: InMemoryWalletTopupCheckoutStore,
+) -> WalletTopupCheckoutService:
+    return WalletTopupCheckoutService(wallet_topup_checkout_store)
+
+
+@pytest.fixture
+def make_wallet_topup_service(
+    settings: Settings,
+    wallet_topup_client: WalletTopupApiClient,
+    session_manager: SessionManager,
+    wallet_topup_quote_service: WalletTopupQuoteService,
+    wallet_topup_checkout_service: WalletTopupCheckoutService,
+) -> Callable[[ClientIdentityProvider], WalletTopupService]:
+    """Build wallet top-up services for different callers over one shared set of stores.
+
+    Wired exactly as ``build_components`` wires the real server, including both invalidation
+    listeners.
+    """
+    session_manager.add_invalidation_listener(wallet_topup_quote_service.invalidate_session)
+    session_manager.add_invalidation_listener(wallet_topup_checkout_service.invalidate_session)
+
+    def factory(identity_provider: ClientIdentityProvider) -> WalletTopupService:
+        return WalletTopupService(
+            settings,
+            wallet_topup_client,
+            session_manager,
+            identity_provider,
+            wallet_topup_quote_service,
+            wallet_topup_checkout_service,
+        )
+
+    return factory
+
+
+@pytest.fixture
+def wallet_topup_service(
+    make_wallet_topup_service: Callable[[ClientIdentityProvider], WalletTopupService],
+    identity_a: StubIdentityProvider,
+) -> WalletTopupService:
+    return make_wallet_topup_service(identity_a)
 
 
 def mock_login_routes(respx_mock: Any, *, email: str = "person@example.com") -> None:

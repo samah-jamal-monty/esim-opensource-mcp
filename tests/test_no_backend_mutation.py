@@ -32,6 +32,7 @@ import respx
 
 from esim_mcp.client.base import (
     FORBIDDEN_PATH_MARKERS,
+    PERMITTED_EXACT_READ_ROUTES,
     PERMITTED_MUTATION_ROUTES,
     PERMITTED_REFERENCE_READ_ROUTES,
     BackendApiClient,
@@ -69,14 +70,25 @@ FORBIDDEN_ROUTES = (
     "/bundles/translate_bundle",
 )
 
-#: The two routes this server may mutate through, and they are not equals: the first debits a
-#: wallet, the second opens a hosted payment page and moves nothing.
+#: The three routes this server may mutate through, and they are not equals: the first debits
+#: a wallet, the other two open a hosted payment page and move nothing.
 MCP_PURCHASE_ROUTE = "/mcp/user/bundle/assign"
 MCP_CARD_CHECKOUT_ROUTE = "/mcp/user/bundle/card/checkout"
+MCP_WALLET_TOPUP_CHECKOUT_ROUTE = "/mcp/wallet/top-up/checkout"
 
-#: The one read whose path ends in a caller-supplied reference, so it cannot be allowlisted by
-#: exact match. Its prefix is, and the segment after it is validated.
+#: The one read whose fixed path nevertheless contains a forbidden marker, so it has to be
+#: named to be reachable at all.
+MCP_WALLET_TOPUP_OPTIONS_ROUTE = "/mcp/wallet/top-up/options"
+
+#: The reads whose paths end in caller-supplied references, so they cannot be allowlisted by
+#: exact match. Their prefixes are, and the segments after them are validated.
 MCP_CARD_STATUS_PREFIX = "/mcp/user/bundle/card/status/"
+MCP_WALLET_TOPUP_STATUS_PREFIX = "/mcp/wallet/top-up/status/"
+CONSUMPTION_PREFIX = "/user/consumption/"
+RELATED_TOPUP_PREFIX = "/user/related-topup/"
+
+#: A well-formed ICCID, used wherever a reference segment has to be a real one.
+ICCID = "8912345678901234567"
 
 MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
@@ -166,17 +178,169 @@ def test_permitting_the_mcp_route_did_not_permit_the_legacy_one() -> None:
             enforce_route_is_permitted("POST", still_forbidden)
 
 
-def test_exactly_the_two_mcp_routes_are_allowlisted() -> None:
-    """A regression guard on the allowlist: growing it must break a test, deliberately."""
+def test_exactly_the_three_mcp_mutations_are_allowlisted() -> None:
+    """A regression guard on the allowlist: growing it must break a test, deliberately.
+
+    Note what is *not* here and never will be: any eSIM top-up route. The platform cannot
+    make a repeated top-up safe without a schema change, so this server has no way to reach
+    one -- not through a client module, and not through the transport either.
+    """
     assert set(PERMITTED_MUTATION_ROUTES) == {
         ("POST", MCP_PURCHASE_ROUTE),
         ("POST", MCP_CARD_CHECKOUT_ROUTE),
+        ("POST", MCP_WALLET_TOPUP_CHECKOUT_ROUTE),
     }
 
 
-def test_exactly_one_reference_read_route_is_allowlisted() -> None:
-    """The prefix allowlist is the only place a dynamic path may be built. Keep it at one."""
-    assert set(PERMITTED_REFERENCE_READ_ROUTES) == {("GET", MCP_CARD_STATUS_PREFIX)}
+def test_exactly_the_expected_reference_reads_are_allowlisted() -> None:
+    """The prefix allowlist is the only place a dynamic path may be built. Keep it exact."""
+    assert set(PERMITTED_REFERENCE_READ_ROUTES) == {
+        ("GET", MCP_CARD_STATUS_PREFIX, 1),
+        ("GET", MCP_WALLET_TOPUP_STATUS_PREFIX, 1),
+        ("GET", CONSUMPTION_PREFIX, 1),
+        ("GET", RELATED_TOPUP_PREFIX, 2),
+    }
+
+
+def test_exactly_one_exact_read_route_is_allowlisted() -> None:
+    """Only one fixed read has to be named back in past a marker. Keep it at one."""
+    assert set(PERMITTED_EXACT_READ_ROUTES) == {("GET", MCP_WALLET_TOPUP_OPTIONS_ROUTE)}
+
+
+def test_the_wallet_topup_checkout_is_permitted_but_the_legacy_top_up_is_not() -> None:
+    """One path contains the other; only the exact MCP ones may pass.
+
+    This is the assertion that would fail if the allowlist were ever loosened into a
+    substring match -- which would silently re-open ``POST /wallet/top-up``, the legacy route
+    that answers with a Stripe client secret and is what the website's payment sheet drives.
+    """
+    enforce_route_is_permitted("POST", MCP_WALLET_TOPUP_CHECKOUT_ROUTE)
+    enforce_route_is_permitted("GET", MCP_WALLET_TOPUP_OPTIONS_ROUTE)
+    enforce_route_is_permitted("GET", f"{MCP_WALLET_TOPUP_STATUS_PREFIX}order-1")
+
+    for still_forbidden in (
+        "/wallet/top-up",
+        "/wallet/top-up/checkout",
+        "/mcp/wallet/top-up",
+        "/mcp/wallet/top-up/checkout/extra",
+        "/api/mcp/wallet/top-up/checkout",
+        "/mcp/wallet/top-up/credit",
+        "/mcp/wallet/top-up/refund",
+    ):
+        with pytest.raises(ForbiddenBackendRouteError):
+            enforce_route_is_permitted("POST", still_forbidden)
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_the_wallet_topup_checkout_route_is_permitted_by_post_and_by_nothing_else(method: str) -> None:
+    enforce_route_is_permitted("POST", MCP_WALLET_TOPUP_CHECKOUT_ROUTE)
+
+    with pytest.raises(ForbiddenBackendRouteError):
+        enforce_route_is_permitted(method, MCP_WALLET_TOPUP_CHECKOUT_ROUTE)
+
+
+def test_the_consumption_read_is_permitted_only_with_one_plain_reference() -> None:
+    """The route the marker list used to refuse outright, now admitted on exact terms."""
+    enforce_route_is_permitted("GET", f"{CONSUMPTION_PREFIX}{ICCID}")
+
+    for still_forbidden in (
+        CONSUMPTION_PREFIX,
+        f"{CONSUMPTION_PREFIX}{ICCID}/extra",
+        f"{CONSUMPTION_PREFIX}../../wallet/top-up",
+        f"{CONSUMPTION_PREFIX}{ICCID}?query=1",
+        "/user/bundle/consumption/" + ICCID,
+    ):
+        with pytest.raises(ForbiddenBackendRouteError):
+            enforce_route_is_permitted("GET", still_forbidden)
+
+    # A read, and only a read.
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        with pytest.raises(ForbiddenBackendRouteError):
+            enforce_route_is_permitted(method, f"{CONSUMPTION_PREFIX}{ICCID}")
+
+
+def test_the_topup_options_read_needs_exactly_two_plain_references() -> None:
+    """Two segments, both validated. One or three is a different route, and is refused."""
+    enforce_route_is_permitted("GET", f"{RELATED_TOPUP_PREFIX}bundle-1/{ICCID}")
+
+    for still_forbidden in (
+        RELATED_TOPUP_PREFIX,
+        f"{RELATED_TOPUP_PREFIX}bundle-1",
+        f"{RELATED_TOPUP_PREFIX}bundle-1/{ICCID}/extra",
+        f"{RELATED_TOPUP_PREFIX}../../user/bundle/assign-top-up/x",
+        f"{RELATED_TOPUP_PREFIX}bundle-1/{ICCID}?query=1",
+    ):
+        with pytest.raises(ForbiddenBackendRouteError):
+            enforce_route_is_permitted("GET", still_forbidden)
+
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        with pytest.raises(ForbiddenBackendRouteError):
+            enforce_route_is_permitted(method, f"{RELATED_TOPUP_PREFIX}bundle-1/{ICCID}")
+
+
+def test_the_esim_topup_execution_route_is_unreachable_by_default() -> None:
+    """The route that actually tops a SIM up is refused unless a QA flag opts in.
+
+    The default matters: every caller that does not deliberately pass the flag -- which is
+    every caller in a production deployment, because production settings refuse to construct
+    with it on -- gets the refusal.
+    """
+    for still_forbidden in (
+        "/user/bundle/assign-top-up",
+        "/mcp/user/bundle/assign-top-up",
+        "/mcp/user/bundle/top-up",
+        "/mcp/user/bundle/topup",
+    ):
+        for method in ("GET", "POST"):
+            with pytest.raises(ForbiddenBackendRouteError):
+                enforce_route_is_permitted(method, still_forbidden)
+
+
+def test_the_qa_flag_admits_exactly_one_extra_route_and_only_by_post() -> None:
+    """Opting in must widen the surface by one route, not by a family."""
+    enforce_route_is_permitted("POST", "/user/bundle/assign-top-up", qa_esim_topup_enabled=True)
+
+    for method in ("GET", "PUT", "PATCH", "DELETE"):
+        with pytest.raises(ForbiddenBackendRouteError):
+            enforce_route_is_permitted(method, "/user/bundle/assign-top-up", qa_esim_topup_enabled=True)
+
+    for neighbour in (
+        "/user/bundle/assign",
+        "/mcp/user/bundle/assign-top-up",
+        "/user/bundle/assign-top-up/extra",
+        "/api/user/bundle/assign-top-up",
+        "/wallet/top-up",
+    ):
+        with pytest.raises(ForbiddenBackendRouteError):
+            enforce_route_is_permitted("POST", neighbour, qa_esim_topup_enabled=True)
+
+
+def test_the_qa_route_is_not_a_member_of_the_standing_allowlist() -> None:
+    """It is opt-in per call, never a permanent member. Adding it must break this test."""
+    from esim_mcp.client.base import QA_ESIM_TOPUP_ROUTE
+
+    assert QA_ESIM_TOPUP_ROUTE not in PERMITTED_MUTATION_ROUTES
+    assert QA_ESIM_TOPUP_ROUTE == ("POST", "/user/bundle/assign-top-up")
+
+
+def test_the_transport_derives_the_qa_flag_from_settings() -> None:
+    """The service gate and the route gate read one Settings object, never two.
+
+    A build where the service thought execution was on and the transport thought it was off
+    (or the reverse) would be a configuration that cannot exist in the real server, so the
+    client is asserted to take its answer from the settings it was constructed with.
+    """
+    from esim_mcp.client.base import BackendApiClient
+
+    off = Settings.build(api_base_url="https://backend.test", environment="qa", device_id_salt="x" * 40)
+    on = Settings.build(
+        api_base_url="https://backend.test",
+        environment="qa",
+        device_id_salt="x" * 40,
+        esim_topup_execution_enabled=True,
+    )
+    assert BackendApiClient(off)._settings.esim_topup_execution_enabled is False
+    assert BackendApiClient(on)._settings.esim_topup_execution_enabled is True
 
 
 def test_the_card_checkout_route_is_permitted_by_post_and_by_nothing_else() -> None:
@@ -397,15 +561,34 @@ _ROUTE_NAMING_ALLOWED = {
     "src/esim_mcp/client/wallet.py",
     "src/esim_mcp/tools/purchase_preparation.py",
     "src/esim_mcp/tools/purchase_execution.py",
+    # Phase 6. Each of these names a forbidden route in prose only, to record why it is
+    # banned: the top-up client explains why the execution route is not wrapped, and the
+    # wallet-top-up client and tool explain why the legacy /wallet/top-up is not called.
+    # ``test_no_code_path_builds_a_forbidden_route_string`` below proves none of them is
+    # built as an actual path.
+    # The top-up client wraps the legacy route under the QA flag and explains, at length,
+    # why it is not safe to repeat. The wallet-top-up client explains why the legacy
+    # /wallet/top-up is never called.
+    "src/esim_mcp/client/topup.py",
+    "src/esim_mcp/client/wallet_topup.py",
+    "src/esim_mcp/tools/esim_topup.py",
+    "src/esim_mcp/tools/wallet_topup.py",
+    # The settings module documents, on the QA flag itself, exactly which route the flag
+    # admits and why that route is dangerous. Naming a hazard next to its switch is the
+    # opposite of shipping it.
+    "src/esim_mcp/settings.py",
 }
 
 #: Files allowed to issue a non-GET request: the authentication client, the transport itself,
-#: and the two clients that own the permitted mutations.
+#: and the three clients that own the permitted mutations.
 _MUTATING_VERB_ALLOWED = {
     "src/esim_mcp/client/auth.py",
     "src/esim_mcp/client/base.py",
     "src/esim_mcp/client/card.py",
     "src/esim_mcp/client/purchase.py",
+    "src/esim_mcp/client/wallet_topup.py",
+    # QA-only, and gated three times over -- see test_the_qa_topup_route_is_gated below.
+    "src/esim_mcp/client/topup.py",
 }
 
 
@@ -415,7 +598,7 @@ def relative(path: Path) -> str:
 
 @pytest.mark.parametrize("route", ["/user/bundle/assign", "wallet/top-up", "verify_order_otp", "assign-top-up"])
 def test_no_source_file_builds_a_forbidden_route(route: str) -> None:
-    """Naming one in prose is fine; only the guard, the purchase client and the docs do."""
+    """Naming one in prose is fine; only the guard, the clients and the docs do."""
     offenders = [
         relative(path)
         for path in source_files()

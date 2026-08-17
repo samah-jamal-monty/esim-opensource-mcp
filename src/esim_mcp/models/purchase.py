@@ -71,3 +71,50 @@ def parse_purchase_result(data: Any) -> BackendPurchaseResult | None:
     except Exception:  # pragma: no cover - defensive; every field is already optional
         logger.warning("purchase_result_unreadable")
         return None
+
+
+class BackendLegacyTopupResult(BaseModel):
+    """The platform's ``PaymentIntentResponse``, as its *legacy* top-up route returns it.
+
+    A different contract from :class:`BackendPurchaseResult` and parsed separately on
+    purpose: the legacy route reports the business outcome in ``payment_status`` and has no
+    ``status`` field at all, so reading it with the MCP purchase model would silently see
+    every top-up as incomplete.
+
+    **The closed field set matters more here than anywhere else in this module.** A
+    ``PaymentIntentResponse`` can carry ``publishable_key``,
+    ``payment_intent_client_secret``, ``customer_id`` and ``customer_ephemeral_key_secret``.
+    None of them is named below, so none of them survives parsing and none can reach a
+    model's context by being forwarded. That is structural, not a promise: adding one would
+    take somebody naming it here.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    order_id: str | None = None
+    payment_status: str | None = None
+
+    @property
+    def is_completed(self) -> bool:
+        """True only where the platform states the wallet payment completed.
+
+        Anything else -- ``PENDING``, ``PENDING_VERIFICATION``, a blank, a word this server
+        does not know -- is **not** a completion. After a request that may have debited a
+        wallet, that is reported as unknown rather than as a failure.
+        """
+        return (self.payment_status or "").strip().upper() == COMPLETED
+
+
+def parse_legacy_topup_result(data: Any) -> BackendLegacyTopupResult | None:
+    """Parse a legacy top-up payload, or return ``None`` when it cannot be read.
+
+    ``None`` is meaningful and must not become an empty result: after a call that may have
+    debited a wallet, "the platform said something I could not read" is an unknown outcome.
+    """
+    if not isinstance(data, dict):
+        return None
+    try:
+        return BackendLegacyTopupResult.model_validate(data)
+    except Exception:  # pragma: no cover - defensive; every field is already optional
+        logger.warning("legacy_topup_result_unreadable")
+        return None

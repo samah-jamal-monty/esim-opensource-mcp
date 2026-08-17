@@ -21,8 +21,11 @@ from esim_mcp.client.auth import AuthApiClient
 from esim_mcp.client.base import BackendApiClient
 from esim_mcp.client.card import CardCheckoutApiClient
 from esim_mcp.client.catalog import CatalogApiClient
+from esim_mcp.client.consumption import ConsumptionApiClient
 from esim_mcp.client.purchase import PurchaseApiClient
+from esim_mcp.client.topup import TopupApiClient
 from esim_mcp.client.wallet import WalletApiClient
+from esim_mcp.client.wallet_topup import WalletTopupApiClient
 from esim_mcp.logging_config import configure_logging
 from esim_mcp.purchase.card import CardCheckoutService, CardCheckoutStore, InMemoryCardCheckoutStore
 from esim_mcp.purchase.execution import (
@@ -32,6 +35,8 @@ from esim_mcp.purchase.execution import (
 )
 from esim_mcp.purchase.service import PurchaseQuoteService
 from esim_mcp.purchase.store import InMemoryPurchaseQuoteStore, PurchaseQuoteStore
+from esim_mcp.selection.service import EsimSelectionService
+from esim_mcp.selection.store import EsimSelectionStore, InMemoryEsimSelectionStore
 from esim_mcp.session.identity import ClientIdentityProvider, build_identity_provider
 from esim_mcp.session.manager import SessionManager
 from esim_mcp.session.store import InMemorySessionStore, SessionStore
@@ -40,6 +45,8 @@ from esim_mcp.tools.account import AccountService, register_account_tools
 from esim_mcp.tools.authentication import AuthenticationService, register_authentication_tools
 from esim_mcp.tools.card_checkout import CardPaymentService, register_card_checkout_tools
 from esim_mcp.tools.catalog import CatalogService, register_catalog_tools
+from esim_mcp.tools.consumption import ConsumptionService, register_consumption_tools
+from esim_mcp.tools.esim_topup import EsimTopupService, register_esim_topup_tools
 from esim_mcp.tools.purchase_execution import (
     PurchaseConfirmationService,
     register_purchase_execution_tools,
@@ -47,6 +54,23 @@ from esim_mcp.tools.purchase_execution import (
 from esim_mcp.tools.purchase_preparation import (
     PurchasePreparationService,
     register_purchase_preparation_tools,
+)
+from esim_mcp.tools.wallet_topup import WalletTopupService, register_wallet_topup_tools
+from esim_mcp.topup.service import (
+    EsimTopupExecutionService,
+    EsimTopupQuoteService,
+    WalletTopupCheckoutService,
+    WalletTopupQuoteService,
+)
+from esim_mcp.topup.store import (
+    EsimTopupExecutionStore,
+    EsimTopupQuoteStore,
+    InMemoryEsimTopupExecutionStore,
+    InMemoryEsimTopupQuoteStore,
+    InMemoryWalletTopupCheckoutStore,
+    InMemoryWalletTopupQuoteStore,
+    WalletTopupCheckoutStore,
+    WalletTopupQuoteStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +80,35 @@ SERVER_NAME = "esim-mcp"
 # Server-level instructions are supported by this SDK version and are returned in the
 # `initialize` result, so they reach the model once per session. They describe how to
 # behave; the per-tool descriptions describe when to call what.
-SERVER_INSTRUCTIONS = """\
+#: The top-up paragraph when this deployment CANNOT carry a top-up out -- the default, and
+#: the only shape a production deployment can have.
+TOPUP_EXECUTION_ABSENT = """\
+- This deployment cannot complete a top-up: there is no tool that does. Give the user the \
+quote, tell them the top-up is finished in the eSIM app or on the website, and give them the \
+plan and the amount so they can find it. Never say a top-up was started, reserved, queued or \
+paid for, and never offer to complete it.
+"""
+
+#: The top-up paragraph when the QA execution flag is on. Everything an assistant has to get
+#: right about a **non-idempotent** write is here, because this is the one capability in the
+#: server where a second call is a second charge rather than a replayed answer.
+TOPUP_EXECUTION_PRESENT = """\
+- confirm_esim_topup completes the top-up and debits the wallet immediately. Before calling \
+it, read all of this back to the user from the quote: which eSIM, the plan, the data, the \
+validity, the exact amount and currency, and that it comes out of their wallet straight away. \
+Then wait for them to agree explicitly. Asking what a top-up costs is not agreement, and \
+neither is silence.
+- confirm_esim_topup is NOT idempotent, unlike every other tool here. Call it AT MOST ONCE \
+per prepared top-up: the platform cannot recognise a second attempt as a repeat, so \
+confirming twice would charge the user twice and add the data twice.
+- Never retry an unknown outcome. If a top-up comes back as unknown, never say it succeeded \
+and never say it failed, do not confirm again and do not prepare a replacement. Find out what \
+actually happened instead -- get_my_esims, get_esim_consumption, the wallet balance in \
+get_user_profile, or get_order_history -- and tell the user to contact eSIM support if it is \
+still unclear.
+"""
+
+_INSTRUCTIONS_TEMPLATE = """\
 You are acting as an eSIM assistant: you help travellers find the right data plan, and you \
 sign them in when something needs their account. These tools are your only way to act on \
 the eSIM platform on the user's behalf.
@@ -197,24 +249,81 @@ own -- "my eSIMs", "my bundles", "where is the one I just bought", "how do I ins
 Plans the platform sells are a different question: use the catalogue tools for those.
 - get_order_history lists what they have bought and paid. Use it for "my orders", "what did \
 I pay", "did my order go through".
-- Neither reports data usage, because the platform sends none. Never tell a user how much \
-data they have left, and never work it out from a date.
+- Neither of those reports data usage. get_esim_consumption does, and it is the only thing \
+that does: use it for "how much data is left", "how much have I used", "is my plan still \
+active". Give the figures exactly as it reports them, and never work a figure out from a \
+date, a price or what the plan originally included.
 - You cannot install, activate or transfer an eSIM. Give them the SM-DP+ address and \
 activation code and say plainly that they add it on their own device. Treat those as \
 credentials: a profile installs once, so give them only to the user who owns the eSIM.
 - If an account has no eSIMs or no orders, say so plainly and never invent one.
+- When the user owns more than one eSIM and it is unclear which they mean, show their eSIMs \
+as a short numbered list and ask. Never guess, and never read an eSIM identifier out unless \
+they ask for it.
+
+Adding more data to an eSIM they already own:
+- get_esim_topup_options is the only source of top-up plans. Only the platform can say what \
+may be added to a SIM already in use, so never offer a plan from the catalogue tools as a \
+top-up, and never say a top-up exists that it did not report.
+- prepare_esim_topup prices one of those options. It creates no order, charges nothing and \
+adds nothing to the SIM.
+{topup_execution}
+Adding money to their wallet:
+- Ask the user how much they want to add and use prepare_wallet_topup with their answer; \
+never choose or round an amount for them. The platform decides what it will accept, and the \
+tool reports what it said.
+- Once they have heard the amount and explicitly agreed to pay it, use \
+create_wallet_topup_checkout and give them the link it returns, immediately and in full. \
+That result is the confirmation: there is no separate signal that a payment page opened, so \
+never wait for one and never say you cannot give them a link.
+- Never ask for a card number, an expiry date or a security code. The card is entered only \
+on Stripe's own secure page, which the link opens in their browser.
+- Opening the page charges nothing and adds nothing to their balance. Say so plainly.
+- get_wallet_topup_status is the only way to know whether a top-up went through. A browser \
+redirect, a success screen, the user coming back, or the user saying "I paid" are not proof \
+of anything. Check when they say they have paid or ask you to, and do not poll.
 
 Scope: this version can sign a user in, report login status, read their own profile and \
 wallet balance, sign them out, browse the plan catalogue read-only, list the eSIMs they \
-already own and the orders they have placed, prepare a purchase quote for a plan the user \
-picked, buy that prepared plan from their wallet once they have explicitly agreed to the \
-amount, and open the platform's own secure card payment page for a prepared card quote and \
-report what happened to that payment. It cannot take card details itself, use vouchers or \
-promotions, top up a wallet, refund or cancel a completed order, or activate, provision or \
-check the usage of an eSIM. Say so plainly if the user asks for one of those, and never \
-imply that something happened which these tools do not do. Always confirm the exact amount \
-with the user before anything is charged.
+already own and the orders they have placed, report the live data usage of one of their \
+eSIMs, list and price the top-ups the platform offers for one of their eSIMs, {topup_scope}\
+prepare a purchase quote for a plan the user picked, buy that prepared plan from their \
+wallet once \
+they have explicitly agreed to the amount, open the platform's own secure card payment page \
+for a prepared card quote and report what happened to that payment, and open the platform's \
+own secure page for adding money to their wallet and report what happened to that. It \
+cannot take card details itself, {topup_denied}use vouchers or promotions, refund \
+or cancel a completed order, or activate or provision an eSIM. Say so plainly if the user \
+asks for one of those, and never imply that something happened which these tools do not do. \
+Always confirm the exact amount with the user before anything is charged.
 """
+
+
+def build_instructions(execution_enabled: bool) -> str:
+    """The server instructions for this deployment.
+
+    The top-up wording is swapped rather than hedged in prose, so the model is never told
+    about ``confirm_esim_topup`` on a deployment where it is not registered. Guidance naming
+    a tool a client cannot call is worse than no guidance: it invites the model to promise a
+    capability and then fail in front of the user. ``tests/test_tool_guidance.py`` asserts
+    that every tool the instructions name is actually published.
+    """
+    if execution_enabled:
+        return _INSTRUCTIONS_TEMPLATE.format(
+            topup_execution=TOPUP_EXECUTION_PRESENT,
+            topup_scope="add a prepared top-up to one of their eSIMs from their wallet, ",
+            topup_denied="",
+        )
+    return _INSTRUCTIONS_TEMPLATE.format(
+        topup_execution=TOPUP_EXECUTION_ABSENT,
+        topup_scope="",
+        topup_denied="complete an eSIM top-up, ",
+    )
+
+
+#: The instructions for a deployment that cannot execute a top-up: the default everywhere,
+#: the only shape production can have, and what the test suite asserts against by default.
+SERVER_INSTRUCTIONS = build_instructions(execution_enabled=False)
 
 
 @dataclass(slots=True)
@@ -229,10 +338,18 @@ class ServerComponents:
     purchase_client: PurchaseApiClient
     card_client: CardCheckoutApiClient
     account_client: AccountApiClient
+    consumption_client: ConsumptionApiClient
+    topup_client: TopupApiClient
+    wallet_topup_client: WalletTopupApiClient
     store: SessionStore
     quote_store: PurchaseQuoteStore
     execution_store: PurchaseExecutionStore
     checkout_store: CardCheckoutStore
+    esim_topup_quote_store: EsimTopupQuoteStore
+    esim_topup_execution_store: EsimTopupExecutionStore
+    esim_selection_store: EsimSelectionStore
+    wallet_topup_quote_store: WalletTopupQuoteStore
+    wallet_topup_checkout_store: WalletTopupCheckoutStore
     session_manager: SessionManager
     identity_provider: ClientIdentityProvider
     service: AuthenticationService
@@ -244,6 +361,13 @@ class ServerComponents:
     confirmation_service: PurchaseConfirmationService
     card_service: CardPaymentService
     account_service: AccountService
+    consumption_service: ConsumptionService
+    esim_topup_quote_service: EsimTopupQuoteService
+    esim_topup_execution_service: EsimTopupExecutionService
+    esim_topup_service: EsimTopupService
+    wallet_topup_quote_service: WalletTopupQuoteService
+    wallet_topup_checkout_service: WalletTopupCheckoutService
+    wallet_topup_service: WalletTopupService
     server: MCPServer
 
     async def aclose(self) -> None:
@@ -252,6 +376,11 @@ class ServerComponents:
         await self.quote_store.aclose()
         await self.execution_store.aclose()
         await self.checkout_store.aclose()
+        await self.esim_topup_quote_store.aclose()
+        await self.esim_topup_execution_store.aclose()
+        await self.esim_selection_store.aclose()
+        await self.wallet_topup_quote_store.aclose()
+        await self.wallet_topup_checkout_store.aclose()
 
 
 def build_components(
@@ -261,6 +390,11 @@ def build_components(
     quote_store: PurchaseQuoteStore | None = None,
     execution_store: PurchaseExecutionStore | None = None,
     checkout_store: CardCheckoutStore | None = None,
+    esim_topup_quote_store: EsimTopupQuoteStore | None = None,
+    esim_topup_execution_store: EsimTopupExecutionStore | None = None,
+    esim_selection_store: EsimSelectionStore | None = None,
+    wallet_topup_quote_store: WalletTopupQuoteStore | None = None,
+    wallet_topup_checkout_store: WalletTopupCheckoutStore | None = None,
     identity_provider: ClientIdentityProvider | None = None,
     backend_client: BackendApiClient | None = None,
 ) -> ServerComponents:
@@ -273,6 +407,9 @@ def build_components(
     purchase_client = PurchaseApiClient(resolved_backend)
     card_client = CardCheckoutApiClient(resolved_backend)
     account_client = AccountApiClient(resolved_backend)
+    consumption_client = ConsumptionApiClient(resolved_backend)
+    topup_client = TopupApiClient(resolved_backend)
+    wallet_topup_client = WalletTopupApiClient(resolved_backend)
     resolved_store = store or InMemorySessionStore()
     session_manager = SessionManager(resolved_settings, resolved_store, auth_client)
     resolved_identity = identity_provider or build_identity_provider(resolved_settings)
@@ -325,11 +462,70 @@ def build_components(
     # Read-only account history. Deliberately built with no quote store, no execution
     # store and no checkout store: these tools answer questions about what the user
     # already owns, and there is nothing in them that could create or alter any of it.
+    # The numbered eSIM listing every follow-up "number 2" resolves against. One service,
+    # shared by the three tools that produce or consume a number, so a listing recorded by
+    # get_my_esims is the same one the consumption and top-up reads look in -- two stores
+    # would be two chances for the numbers to disagree.
+    resolved_esim_selection_store = esim_selection_store or InMemoryEsimSelectionStore()
+    esim_selection_service = EsimSelectionService(resolved_esim_selection_store)
+
     account_service = AccountService(
         resolved_settings,
         account_client,
         session_manager,
         resolved_identity,
+        esim_selection_service,
+    )
+
+    # Live usage. Built with the account client as well as the consumption client, because
+    # the ICCID a caller may ask about is resolved against that caller's *own* eSIM list
+    # before the platform is asked anything: an identifier that is not theirs never leaves
+    # this process. Deliberately no quote, execution or checkout store -- there is nothing
+    # in this service that could create, alter or pay for anything.
+    consumption_service = ConsumptionService(
+        resolved_settings,
+        account_client,
+        consumption_client,
+        session_manager,
+        resolved_identity,
+        esim_selection_service,
+    )
+
+    # eSIM top-up. Reads and quotes always; execution only when the QA flag is on, which
+    # production settings refuse to construct. The execution store holds the one-attempt
+    # lock that stands in for the durable idempotency the platform does not offer -- see
+    # esim_mcp.tools.esim_topup for exactly what that does and does not promise.
+    resolved_esim_topup_quote_store = esim_topup_quote_store or InMemoryEsimTopupQuoteStore()
+    resolved_esim_topup_execution_store = esim_topup_execution_store or InMemoryEsimTopupExecutionStore()
+    esim_topup_quote_service = EsimTopupQuoteService(resolved_settings, resolved_esim_topup_quote_store)
+    esim_topup_execution_service = EsimTopupExecutionService(resolved_esim_topup_execution_store)
+    esim_topup_service = EsimTopupService(
+        resolved_settings,
+        account_client,
+        topup_client,
+        wallet_client,
+        session_manager,
+        resolved_identity,
+        esim_topup_quote_service,
+        esim_topup_execution_service,
+        esim_selection_service,
+    )
+
+    # Wallet top-up. The third and last way this server can lead to a charge, and like the
+    # card checkout the money moves entirely outside this process: it opens the platform's
+    # hosted payment page and then reads what happened. Nothing here can credit a balance --
+    # only the platform's signature-verified webhook does that.
+    resolved_wallet_topup_quote_store = wallet_topup_quote_store or InMemoryWalletTopupQuoteStore()
+    resolved_wallet_topup_checkout_store = wallet_topup_checkout_store or InMemoryWalletTopupCheckoutStore()
+    wallet_topup_quote_service = WalletTopupQuoteService(resolved_settings, resolved_wallet_topup_quote_store)
+    wallet_topup_checkout_service = WalletTopupCheckoutService(resolved_wallet_topup_checkout_store)
+    wallet_topup_service = WalletTopupService(
+        resolved_settings,
+        wallet_topup_client,
+        session_manager,
+        resolved_identity,
+        wallet_topup_quote_service,
+        wallet_topup_checkout_service,
     )
 
     # A prepared quote must not outlive the session that created it: on logout, on session
@@ -337,9 +533,21 @@ def build_components(
     # and the execution and checkout records (with their idempotency keys) go with it. A key
     # surviving its session would let whoever signs in next replay somebody else's purchase,
     # or read somebody else's payment.
+    #
+    # The same rule extends to the two top-up flows, and for the top-up quote it is
+    # sharper still: that record *names an ICCID*, so a quote surviving its session would
+    # hand whoever signs in next a reference to somebody else's SIM.
     session_manager.add_invalidation_listener(quote_service.invalidate_session)
     session_manager.add_invalidation_listener(execution_service.invalidate_session)
     session_manager.add_invalidation_listener(checkout_service.invalidate_session)
+    session_manager.add_invalidation_listener(esim_topup_quote_service.invalidate_session)
+    session_manager.add_invalidation_listener(esim_topup_execution_service.invalidate_session)
+    session_manager.add_invalidation_listener(wallet_topup_quote_service.invalidate_session)
+    session_manager.add_invalidation_listener(wallet_topup_checkout_service.invalidate_session)
+    # Sharper than any of the above: the selection listing maps a number the user typed to a
+    # full ICCID. Left behind after a logout it would let whoever signs in next on the same
+    # MCP client turn "number 2" into somebody else's SIM.
+    session_manager.add_invalidation_listener(esim_selection_service.invalidate_session)
 
     components: ServerComponents | None = None
 
@@ -363,7 +571,9 @@ def build_components(
     server = MCPServer(
         name=SERVER_NAME,
         title="eSIM MCP Server",
-        instructions=SERVER_INSTRUCTIONS,
+        instructions=build_instructions(
+            execution_enabled=esim_topup_service.execution_enabled
+        ),
         version=__version__,
         log_level=resolved_settings.log_level,
         lifespan=lifespan,
@@ -374,6 +584,9 @@ def build_components(
     register_purchase_execution_tools(server, confirmation_service)
     register_card_checkout_tools(server, card_service)
     register_account_tools(server, account_service)
+    register_consumption_tools(server, consumption_service)
+    register_esim_topup_tools(server, esim_topup_service)
+    register_wallet_topup_tools(server, wallet_topup_service)
 
     components = ServerComponents(
         settings=resolved_settings,
@@ -384,10 +597,18 @@ def build_components(
         purchase_client=purchase_client,
         card_client=card_client,
         account_client=account_client,
+        consumption_client=consumption_client,
+        topup_client=topup_client,
+        wallet_topup_client=wallet_topup_client,
         store=resolved_store,
         quote_store=resolved_quote_store,
         execution_store=resolved_execution_store,
         checkout_store=resolved_checkout_store,
+        esim_topup_quote_store=resolved_esim_topup_quote_store,
+        esim_topup_execution_store=resolved_esim_topup_execution_store,
+        esim_selection_store=resolved_esim_selection_store,
+        wallet_topup_quote_store=resolved_wallet_topup_quote_store,
+        wallet_topup_checkout_store=resolved_wallet_topup_checkout_store,
         session_manager=session_manager,
         identity_provider=resolved_identity,
         service=service,
@@ -399,6 +620,13 @@ def build_components(
         confirmation_service=confirmation_service,
         card_service=card_service,
         account_service=account_service,
+        consumption_service=consumption_service,
+        esim_topup_quote_service=esim_topup_quote_service,
+        esim_topup_execution_service=esim_topup_execution_service,
+        esim_topup_service=esim_topup_service,
+        wallet_topup_quote_service=wallet_topup_quote_service,
+        wallet_topup_checkout_service=wallet_topup_checkout_service,
+        wallet_topup_service=wallet_topup_service,
         server=server,
     )
     return components

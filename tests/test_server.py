@@ -47,7 +47,50 @@ CARD_CHECKOUT_TOOLS = {"create_card_checkout", "check_card_payment_status"}
 #: cancel, refund or top-up tool alongside them -- a model cannot call what does not exist.
 ACCOUNT_TOOLS = {"get_my_esims", "get_order_history"}
 
+#: Phase 6A. Exactly one, and it is a read: the platform's live usage figures for one eSIM
+#: the caller owns. There is deliberately no reset, extend or activate alongside it.
+CONSUMPTION_TOOLS = {"get_esim_consumption"}
+
+#: Phase 6B. Four tools, and **every one of them is free**: a read of the platform's own
+#: compatibility list, a local quote, a read-back and a local discard.
+#:
+#: There is deliberately no ``confirm_esim_topup``. The platform's top-up route takes no
+#: idempotency key and its ``Topup`` order row carries neither an ICCID nor a request key, so
+#: a retry cannot be told apart from a second genuine request without a schema change this
+#: branch does not make. Keeping the key in this process would look safe and stop being safe
+#: on the next restart, so the write tool is absent instead. A model cannot call what does
+#: not exist, and this set is the assertion that keeps it that way.
+ESIM_TOPUP_TOOLS = {
+    "get_esim_topup_options",
+    "prepare_esim_topup",
+    "get_prepared_esim_topup",
+    "cancel_prepared_esim_topup",
+}
+
+#: Phase 6C. Exactly three wallet top-up tools: one quotes an amount against the platform's
+#: own limits, one opens the platform's hosted payment page, one reads what happened. None
+#: of them can credit a balance -- only the platform's signature-verified webhook does that.
+WALLET_TOPUP_TOOLS = {
+    "prepare_wallet_topup",
+    "create_wallet_topup_checkout",
+    "get_wallet_topup_status",
+}
+
 EXPECTED_TOOLS = (
+    AUTHENTICATION_TOOLS
+    | CATALOG_TOOLS
+    | PURCHASE_PREPARATION_TOOLS
+    | PURCHASE_EXECUTION_TOOLS
+    | CARD_CHECKOUT_TOOLS
+    | ACCOUNT_TOOLS
+    | CONSUMPTION_TOOLS
+    | ESIM_TOPUP_TOOLS
+    | WALLET_TOPUP_TOOLS
+)
+
+#: Everything shipped before this phase. Used to assert what Phase 6 *added*, so a tool
+#: quietly removed or renamed by it fails a test rather than a review.
+PRE_PHASE_SIX_TOOLS = (
     AUTHENTICATION_TOOLS
     | CATALOG_TOOLS
     | PURCHASE_PREPARATION_TOOLS
@@ -126,7 +169,7 @@ async def test_exactly_one_tool_can_spend_a_wallet_balance(settings: Settings) -
     names = {tool.name for tool in tools}
     added = (
         names - AUTHENTICATION_TOOLS - CATALOG_TOOLS - PURCHASE_PREPARATION_TOOLS - CARD_CHECKOUT_TOOLS
-        - ACCOUNT_TOOLS
+        - ACCOUNT_TOOLS - CONSUMPTION_TOOLS - ESIM_TOPUP_TOOLS - WALLET_TOPUP_TOOLS
     )
     assert added == PURCHASE_EXECUTION_TOOLS
     assert len(added) == 1
@@ -143,10 +186,113 @@ async def test_exactly_two_card_tools_were_added(settings: Settings) -> None:
     names = {tool.name for tool in tools}
     added = (
         names - AUTHENTICATION_TOOLS - CATALOG_TOOLS - PURCHASE_PREPARATION_TOOLS - PURCHASE_EXECUTION_TOOLS
-        - ACCOUNT_TOOLS
+        - ACCOUNT_TOOLS - CONSUMPTION_TOOLS - ESIM_TOPUP_TOOLS - WALLET_TOPUP_TOOLS
     )
     assert added == CARD_CHECKOUT_TOOLS
     assert len(added) == 2
+
+
+async def test_phase_six_added_exactly_the_usage_and_top_up_tools(settings: Settings) -> None:
+    """Phase 6 adds a usage read, four free top-up tools and three wallet top-up tools.
+
+    Nothing else. In particular it does **not** add a tool that performs an eSIM top-up: the
+    platform cannot yet make a repeated one safe, and this assertion is what keeps the
+    absence deliberate rather than accidental.
+    """
+    components = build_components(settings, identity_provider=StubIdentityProvider("client-a"))
+    try:
+        tools = await components.server.list_tools()
+    finally:
+        await components.aclose()
+
+    names = {tool.name for tool in tools}
+    added = names - PRE_PHASE_SIX_TOOLS
+
+    assert added == CONSUMPTION_TOOLS | ESIM_TOPUP_TOOLS | WALLET_TOPUP_TOOLS
+    # The one name that must not appear, spelled out so its absence is asserted directly.
+    assert "confirm_esim_topup" not in names
+    assert not any(name.startswith("confirm_") and "topup" in name for name in names)
+
+
+async def test_no_phase_six_tool_can_be_told_that_money_arrived(settings: Settings) -> None:
+    """Only the platform decides whether a payment happened, so nothing takes it as input."""
+    components = build_components(settings, identity_provider=StubIdentityProvider("client-a"))
+    try:
+        tools = await components.server.list_tools()
+    finally:
+        await components.aclose()
+
+    named = {tool.name: tool for tool in tools}
+    for name in CONSUMPTION_TOOLS | ESIM_TOPUP_TOOLS | WALLET_TOPUP_TOOLS:
+        arguments = set(named[name].input_schema["properties"])
+        for forbidden in (
+            "paid",
+            "credited",
+            "charged",
+            "status",
+            "payment_status",
+            "success",
+            "confirmed",
+            "user_id",
+            "wallet_id",
+            "order_id",
+            "balance",
+        ):
+            assert forbidden not in arguments, f"{name} accepts {forbidden!r}"
+
+
+async def test_no_wallet_top_up_tool_accepts_a_card_detail(settings: Settings) -> None:
+    """The structural half of "this server never sees a card": there is nowhere to put one."""
+    components = build_components(settings, identity_provider=StubIdentityProvider("client-a"))
+    try:
+        tools = await components.server.list_tools()
+    finally:
+        await components.aclose()
+
+    named = {tool.name: tool for tool in tools}
+    assert set(named["create_wallet_topup_checkout"].input_schema["properties"]) == {"quote_reference"}
+    assert set(named["get_wallet_topup_status"].input_schema["properties"]) == {"payment_reference"}
+
+    for name in WALLET_TOPUP_TOOLS:
+        arguments = set(named[name].input_schema["properties"])
+        for forbidden in (
+            "card_number",
+            "card",
+            "pan",
+            "cvv",
+            "cvc",
+            "expiry",
+            "expiry_month",
+            "expiry_year",
+            "cardholder",
+            "billing_address",
+            "postcode",
+            "payment_token",
+            "payment_method_id",
+            "checkout_url",
+        ):
+            assert forbidden not in arguments, f"{name} accepts {forbidden!r}"
+
+
+async def test_the_only_amount_argument_anywhere_is_the_wallet_top_up_one(settings: Settings) -> None:
+    """A price is read from the platform everywhere else; only a top-up amount is asked for.
+
+    That asymmetry is the point: a plan's price is the platform's to state, so no tool takes
+    one. How much money a user wants to add to their own wallet is *theirs* to state, so one
+    tool takes it -- and the platform still decides whether it will accept it.
+    """
+    components = build_components(settings, identity_provider=StubIdentityProvider("client-a"))
+    try:
+        tools = await components.server.list_tools()
+    finally:
+        await components.aclose()
+
+    with_amount = {
+        tool.name
+        for tool in tools
+        if {"amount", "price", "total", "cost"} & set(tool.input_schema["properties"])
+    }
+    assert with_amount == {"prepare_wallet_topup"}
 
 
 async def test_no_card_tool_accepts_a_card_detail_or_an_amount(settings: Settings) -> None:
@@ -237,15 +383,15 @@ async def test_no_tool_accepts_a_token_or_an_identity_argument(settings: Setting
 
 
 async def test_no_payment_provider_or_provisioning_tools_are_registered(settings: Settings) -> None:
-    """Two ways to pay exist. Everything else money can do is still out.
+    """Three ways to pay exist. Everything else money can do is still out.
 
     Each phase narrows this list rather than abandoning it. Phase 4 could no longer ban the
-    vocabulary of buying -- ``confirm_purchase`` is the point of it -- and Phase 5B can no
-    longer ban "card" or "checkout" for the same reason. What stays banned is every *other*
-    way to move money or change an order: naming a payment provider, taking a payment here,
-    top-ups, vouchers, promotions, refunds, order OTPs and anything that touches a
-    provisioned eSIM. None of those is implemented, and a tool named after one would be the
-    first sign that changed.
+    vocabulary of buying -- ``confirm_purchase`` is the point of it -- Phase 5B could no
+    longer ban "card" or "checkout", and Phase 6 could no longer ban "topup" or
+    "consumption". What stays banned is every *other* way to move money or change an order:
+    naming a payment provider, taking a payment here, vouchers, promotions, refunds, order
+    OTPs and anything that touches a provisioned eSIM. None of those is implemented, and a
+    tool named after one would be the first sign that changed.
     """
     components = build_components(settings, identity_provider=StubIdentityProvider("client-a"))
     try:
@@ -261,25 +407,31 @@ async def test_no_payment_provider_or_provisioning_tools_are_registered(settings
         "stripe",
         "voucher",
         "promo",
-        "topup",
-        "top_up",
         "activate",
         "provision",
         "install",
-        "consumption",
-        "usage",
         "callback",
         "translate",
         "refund",
         "cancel_order",
         "assign",
+        # Crediting a balance is the webhook's job. No tool here may be named after it.
+        "credit",
     ):
         assert forbidden not in joined, f"a tool name contains {forbidden!r}"
 
-    # Every tool whose name mentions a purchase is one of the four purchase tools, and every
-    # tool whose name mentions a card or a checkout is one of the two card tools.
+    # Every tool whose name mentions a purchase is one of the four purchase tools; every one
+    # that mentions a card is one of the two card tools; every one that mentions a top-up is
+    # one of the seven top-up tools; and every checkout is a card or a wallet top-up one.
     assert {name for name in names if "purchase" in name} == PURCHASE_PREPARATION_TOOLS | PURCHASE_EXECUTION_TOOLS
-    assert {name for name in names if "card" in name or "checkout" in name} == CARD_CHECKOUT_TOOLS
+    assert {name for name in names if "card" in name} == CARD_CHECKOUT_TOOLS
+    assert {name for name in names if "topup" in name} == ESIM_TOPUP_TOOLS | WALLET_TOPUP_TOOLS
+    assert {name for name in names if "checkout" in name} == {
+        "create_card_checkout",
+        "create_wallet_topup_checkout",
+    }
+    # "usage" and "consumption" are now legitimate, but only for the one read that has them.
+    assert {name for name in names if "consumption" in name or "usage" in name} == CONSUMPTION_TOOLS
 
 
 async def test_exactly_one_tool_is_annotated_as_able_to_spend_money(settings: Settings) -> None:

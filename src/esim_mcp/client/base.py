@@ -68,20 +68,64 @@ _INITIAL_BACKOFF_SECONDS = 0.2
 #: * ``/mcp/user/bundle/card/checkout`` opens a hosted payment page and moves nothing. The
 #:   card itself is entered on the payment provider's own page, never here -- this server
 #:   never sees a card number and cannot capture a payment.
+#: * ``/mcp/wallet/top-up/checkout`` opens a hosted payment page for a wallet top-up. Like
+#:   the card checkout it moves nothing: it creates an *unpaid* order and a Stripe-hosted
+#:   page, and only the platform's signature-verified webhook can credit the balance. The
+#:   legacy ``POST /wallet/top-up`` stays forbidden below and always will be -- it answers
+#:   with a payment-intent client secret, which is useless to a chat client and dangerous to
+#:   put anywhere near one.
 PERMITTED_MUTATION_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/mcp/user/bundle/assign"),
         ("POST", "/mcp/user/bundle/card/checkout"),
+        ("POST", "/mcp/wallet/top-up/checkout"),
     }
 )
 
-#: Read-only MCP routes whose last path segment is a reference rather than a fixed word, so
+#: **QA-only, and off unless a flag says otherwise.** The platform's *legacy* eSIM top-up
+#: route. It is deliberately NOT a member of :data:`PERMITTED_MUTATION_ROUTES`: it is only
+#: reachable when :func:`enforce_route_is_permitted` is called with
+#: ``qa_esim_topup_enabled=True``, which :class:`BackendApiClient` derives from
+#: :attr:`~esim_mcp.settings.Settings.esim_topup_execution_enabled` -- a flag that defaults
+#: to off and that production settings refuse to construct.
+#:
+#: Everything about this route is worse than the routes above, and none of it is fixable
+#: from this side: no idempotency key, no request-key column on the row it writes, a wallet
+#: debit *before* provisioning, and a swallowed provisioning failure. It is admitted for QA
+#: so the flow can be exercised end to end, and for no other reason.
+QA_ESIM_TOPUP_ROUTE: tuple[str, str] = ("POST", "/user/bundle/assign-top-up")
+
+#: Reads whose *fixed* path nevertheless contains a forbidden marker, so they have to be
+#: named here to be reachable at all. Exact ``(method, path)`` match, never a substring:
+#: ``/mcp/wallet/top-up/options`` is permitted and ``/wallet/top-up`` is not, and one is not
+#: a prefix of the other by accident.
+PERMITTED_EXACT_READ_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/mcp/wallet/top-up/options")})
+
+#: Read-only routes whose trailing path segments are references rather than fixed words, so
 #: they cannot be allowlisted by exact match. The prefix is matched exactly and the remainder
-#: must be **one** opaque segment: no slash, no dot-segment, no query, no marker smuggled in.
-#: A path that starts with one of these prefixes and fails that check is refused outright
-#: rather than falling through to the marker scan, so a malformed reference can never be
-#: rescued by simply not containing a banned word.
-PERMITTED_REFERENCE_READ_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/mcp/user/bundle/card/status/")})
+#: must be exactly ``segments`` opaque segments: no extra slash, no dot-segment, no query, no
+#: marker smuggled in. A path that starts with one of these prefixes and fails that check is
+#: refused outright rather than falling through to the marker scan, so a malformed reference
+#: can never be rescued by simply not containing a banned word.
+#:
+#: Each entry is ``(method, prefix, segments)``:
+#:
+#: * the card payment status, keyed on one payment reference;
+#: * the wallet top-up status, keyed on one payment reference;
+#: * ``/user/consumption/{iccid}`` -- the platform's own live usage read, which the marker
+#:   list would otherwise refuse. It is a **read**: it provisions nothing, tops up nothing
+#:   and is scoped to the caller by the backend, which resolves the ICCID against the
+#:   authenticated user's own profiles before asking the provider;
+#: * ``/user/related-topup/{bundle_code}/{iccid}`` -- the platform's own list of top-up
+#:   bundles compatible with one of the caller's eSIMs. Two segments, both validated.
+PERMITTED_REFERENCE_READ_ROUTES: frozenset[tuple[str, str, int]] = frozenset(
+    {
+        ("GET", "/mcp/user/bundle/card/status/", 1),
+        ("GET", "/mcp/wallet/top-up/status/", 1),
+        ("GET", "/user/consumption/", 1),
+        ("GET", "/user/related-topup/", 2),
+    }
+)
 
 #: The shape a reference may take inside a permitted path. Deliberately narrower than the URL
 #: spec allows: this server generates none of these values, so anything unusual in one came
@@ -104,6 +148,16 @@ FORBIDDEN_PATH_MARKERS: tuple[str, ...] = (
     # named above is impossible.
     "bundle/card",
     "verify_order_otp",
+    # The whole top-up family is banned and then four members are allowlisted back above,
+    # exactly as ``bundle/assign`` is. Both spellings are listed because the platform uses
+    # both: ``/user/bundle/assign-top-up`` and ``/user/related-topup/...``. Without them,
+    # any *other* top-up route -- ``/mcp/user/bundle/topup``, a future ``/wallet/credit`` --
+    # would be reachable simply by not spelling a banned word, since everything here is a
+    # denylist. With them, the only top-up paths that resolve are the four named above: the
+    # compatibility read, the wallet options read, the wallet checkout and its status read.
+    # The route that actually tops a SIM up is not among them and is not implemented.
+    "top-up",
+    "topup",
     "wallet/top-up",
     "user_wallet_by_id",
     "voucher",
@@ -195,6 +249,17 @@ class BackendApiClient:
         )
 
     @property
+    def settings(self) -> Settings:
+        """The settings this transport was built from.
+
+        Exposed so a client module can size its *own* read budget from configuration without
+        being handed a second :class:`~esim_mcp.settings.Settings` at construction, which
+        would make it possible for a transport and the module using it to disagree about
+        the configuration they are running under.
+        """
+        return self._settings
+
+    @property
     def base_url(self) -> str:
         """Normalized backend base URL including the ``/api/v1`` prefix."""
         return self._settings.api_v1_url
@@ -260,15 +325,26 @@ class BackendApiClient:
         currency: str | None = None,
         credentials: RequestCredentials | None = None,
         allow_retry: bool = False,
+        read_timeout: float | None = None,
     ) -> Any:
         """Perform a request and return only the envelope's ``data`` payload.
 
         ``allow_retry`` must stay ``False`` for every mutation: OTP request, OTP resend,
         OTP verification, refresh-token rotation and logout are never replayed.
 
+        ``read_timeout`` overrides the pooled client's read budget for this one call and
+        leaves every other caller on the configured default. It exists for reads the platform
+        builds per user rather than serves from a cache, which take far longer than the
+        cached lookups :attr:`~esim_mcp.settings.Settings.read_timeout` is sized for. A
+        widened budget and ``allow_retry=True`` do not belong together: three attempts at a
+        two-minute budget is six minutes of a chat client waiting to be told the same thing,
+        so a caller that widens this is expected to take a single attempt.
+
         Fails closed before any I/O when the method or the path is not permitted.
         """
-        enforce_route_is_permitted(method, path)
+        enforce_route_is_permitted(
+            method, path, qa_esim_topup_enabled=self._settings.esim_topup_execution_enabled
+        )
         url = self.url_for(path)
         headers = self.build_headers(device_id=device_id, locale=locale, currency=currency, credentials=credentials)
         attempts = _MAX_READ_ATTEMPTS if allow_retry else 1
@@ -278,7 +354,12 @@ class BackendApiClient:
             started = time.monotonic()
             try:
                 response = await self._client.request(
-                    method.upper(), url, json=json_body, params=params, headers=headers
+                    method.upper(),
+                    url,
+                    json=json_body,
+                    params=params,
+                    headers=headers,
+                    **self._timeout_override(read_timeout),
                 )
             except httpx.TimeoutException:
                 last_error = BackendTimeoutError()
@@ -337,7 +418,9 @@ class BackendApiClient:
 
         Fails closed before any I/O when the method or the path is not permitted.
         """
-        enforce_route_is_permitted(method, path)
+        enforce_route_is_permitted(
+            method, path, qa_esim_topup_enabled=self._settings.esim_topup_execution_enabled
+        )
         url = self.url_for(path)
         headers = self.build_headers(
             device_id=device_id,
@@ -467,8 +550,14 @@ def _outcome_of(response: httpx.Response) -> BackendOutcome:
     return BackendOutcome(status_code=response.status_code, envelope=envelope, parsed=True)
 
 
-def enforce_route_is_permitted(method: str, path: str) -> None:
+def enforce_route_is_permitted(method: str, path: str, *, qa_esim_topup_enabled: bool = False) -> None:
     """Raise unless ``method`` and ``path`` are ones this server is allowed to call.
+
+    ``qa_esim_topup_enabled`` admits exactly one extra route,
+    :data:`QA_ESIM_TOPUP_ROUTE`, and defaults to ``False`` so that every caller that does not
+    deliberately opt in -- including every existing one -- keeps the stricter behaviour. With
+    the flag off the legacy top-up route is refused here, before any I/O, exactly as it
+    always was.
 
     Deliberately at the transport boundary: a new client module, or a future phase, cannot
     reach an order, payment, voucher, provisioning or top-up route even by accident. The
@@ -487,13 +576,22 @@ def enforce_route_is_permitted(method: str, path: str) -> None:
     normalized_path = f"/{path.strip().lstrip('/')}".lower()
     if (normalized_method, normalized_path) in PERMITTED_MUTATION_ROUTES:
         return
+    if (normalized_method, normalized_path) in PERMITTED_EXACT_READ_ROUTES:
+        return
+    if qa_esim_topup_enabled and (normalized_method, normalized_path) == QA_ESIM_TOPUP_ROUTE:
+        # Exact whole-path match, like every other allowlist entry, so no neighbour of this
+        # route (``/user/bundle/assign``, ``/mcp/user/bundle/assign-top-up``, anything with a
+        # suffix) is admitted alongside it.
+        logger.warning("qa_esim_topup_route_permitted", extra={"http_path": normalized_path})
+        return
 
-    for allowed_method, prefix in PERMITTED_REFERENCE_READ_ROUTES:
+    for allowed_method, prefix, segments in PERMITTED_REFERENCE_READ_ROUTES:
         if not normalized_path.startswith(prefix):
             continue
-        # Reaching the prefix at all decides the outcome here: a wrong method or a reference
-        # that is not one plain segment is refused, never handed on to the marker scan.
-        if normalized_method == allowed_method and _REFERENCE_SEGMENT_RE.match(normalized_path[len(prefix) :]):
+        # Reaching the prefix at all decides the outcome here: a wrong method, or a
+        # remainder that is not exactly ``segments`` plain segments, is refused and never
+        # handed on to the marker scan.
+        if normalized_method == allowed_method and _reference_segments_ok(normalized_path[len(prefix) :], segments):
             return
         logger.error(
             "forbidden_backend_reference_route",
@@ -508,6 +606,20 @@ def enforce_route_is_permitted(method: str, path: str) -> None:
                 extra={"http_method": normalized_method, "http_path": normalized_path, "marker": marker},
             )
             raise ForbiddenBackendRouteError()
+
+
+def _reference_segments_ok(remainder: str, expected: int) -> bool:
+    """True when ``remainder`` is exactly ``expected`` plain, opaque path segments.
+
+    Split rather than regex-matched across the whole remainder, so ``a/b`` cannot satisfy a
+    one-segment route and ``a`` cannot satisfy a two-segment one. An empty part -- which is
+    what a leading, trailing or doubled slash produces -- fails the segment pattern and
+    therefore fails the whole check.
+    """
+    parts = remainder.split("/")
+    if len(parts) != expected:
+        return False
+    return all(_REFERENCE_SEGMENT_RE.match(part) for part in parts)
 
 
 _OTP_ERROR_MATCHERS: tuple[tuple[tuple[str, ...], type[EsimMcpError]], ...] = (

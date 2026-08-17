@@ -53,6 +53,25 @@ CARD_TOOL_NAMES = {"create_card_checkout", "check_card_payment_status"}
 #: Read-only history of what the signed-in user already owns. Neither can change anything.
 ACCOUNT_TOOL_NAMES = {"get_my_esims", "get_order_history"}
 
+#: Phase 6A: the platform's live usage figures for one eSIM the caller owns. A read.
+CONSUMPTION_TOOL_NAMES = {"get_esim_consumption"}
+
+#: Phase 6B: four tools, and every one of them is free. There is deliberately no tool that
+#: performs a top-up -- the platform cannot make a repeated one safe without a schema change.
+ESIM_TOPUP_TOOL_NAMES = {
+    "get_esim_topup_options",
+    "prepare_esim_topup",
+    "get_prepared_esim_topup",
+    "cancel_prepared_esim_topup",
+}
+
+#: Phase 6C: quote an amount, open the platform's hosted page, read what happened.
+WALLET_TOPUP_TOOL_NAMES = {
+    "prepare_wallet_topup",
+    "create_wallet_topup_checkout",
+    "get_wallet_topup_status",
+}
+
 TOOL_NAMES = (
     AUTH_TOOL_NAMES
     | CATALOG_TOOL_NAMES
@@ -60,6 +79,9 @@ TOOL_NAMES = (
     | EXECUTION_TOOL_NAMES
     | CARD_TOOL_NAMES
     | ACCOUNT_TOOL_NAMES
+    | CONSUMPTION_TOOL_NAMES
+    | ESIM_TOPUP_TOOL_NAMES
+    | WALLET_TOPUP_TOOL_NAMES
 )
 
 #: Capabilities this server still does not have. A description may only mention one of
@@ -68,14 +90,19 @@ TOOL_NAMES = (
 #: Each phase narrows this list rather than abandoning it. Phase 4 can complete a *wallet*
 #: purchase, so "place an order" left the list -- creating one is the tool's job, and hiding
 #: that from the description would be the dangerous choice. Phase 5B can open the platform's
-#: hosted card checkout, so "checkout" left it too. What stays out is every remaining way to
-#: move money: a top-up, a voucher, a promotion, a refund and provisioning.
+#: hosted card checkout, so "checkout" left it too, and Phase 6 can quote a top-up and open a
+#: wallet top-up page, so "top-up" left it as well. What stays out is every remaining way to
+#: move money: a voucher, a promotion, a refund and provisioning.
 FORBIDDEN_CAPABILITY_WORDS = (
     "provision",
-    "top-up",
     "voucher",
-    "wallet top",
+    "refund the",
 )
+
+#: The one capability Phase 6 quotes but cannot perform. Because "top-up" is now legitimate
+#: vocabulary, the guard shifts from banning the *word* to pinning the *claim*: every tool
+#: that talks about topping a SIM up must also say plainly that this assistant cannot do it.
+ESIM_TOPUP_DISCLAIMERS = ("cannot", "eSIM app or on the website")
 
 
 @pytest.fixture
@@ -204,6 +231,12 @@ TOOLS_NAMED_IN_INSTRUCTIONS = {
     "check_card_payment_status",
     "get_my_esims",
     "get_order_history",
+    "get_esim_consumption",
+    "get_esim_topup_options",
+    "prepare_esim_topup",
+    "prepare_wallet_topup",
+    "create_wallet_topup_checkout",
+    "get_wallet_topup_status",
 }
 
 
@@ -220,8 +253,34 @@ def test_instructions_state_the_scope() -> None:
     assert "browse the plan catalogue read-only" in scope
     # Anything outside the current phase may only appear as something the server cannot do.
     assert "It cannot" in scope
-    for absent_capability in ("take card details itself", "vouchers", "top up", "refund", "activate", "provision"):
+    for absent_capability in (
+        "take card details itself",
+        "complete an eSIM top-up",
+        "vouchers",
+        "refund",
+        "activate",
+        "provision",
+    ):
         assert absent_capability in scope
+
+
+def test_the_scope_admits_reading_usage_and_quoting_a_top_up_but_not_performing_one() -> None:
+    """The Phase 6 line the model has to get right: usage and quotes are in, a top-up is not."""
+    scope = SERVER_INSTRUCTIONS.split("Scope:", 1)[1]
+    assert "report the live data usage" in scope
+    assert "list and price the top-ups" in scope
+    assert "It cannot take card details itself, complete an eSIM top-up" in scope
+
+
+def test_the_scope_admits_a_wallet_top_up_page_but_never_crediting_a_balance() -> None:
+    """Opening the page is in. Adding the money is the platform webhook's job, not this one's."""
+    scope = SERVER_INSTRUCTIONS.split("Scope:", 1)[1]
+    assert "open the platform's own secure page for adding money to their wallet" in scope
+    assert "report what happened to that" in scope
+
+    lowered = SERVER_INSTRUCTIONS.lower()
+    assert "opening the page charges nothing and adds nothing to their balance" in lowered
+    assert "get_wallet_topup_status is the only way to know whether a top-up went through" in lowered
 
 
 def test_the_scope_admits_a_wallet_purchase_and_nothing_wider() -> None:
@@ -244,7 +303,12 @@ def test_the_scope_admits_a_card_payment_but_never_taking_a_card() -> None:
 
 def test_the_scope_still_denies_every_other_way_to_move_money() -> None:
     scope = SERVER_INSTRUCTIONS.split("Scope:", 1)[1]
-    for denied in ("take card details itself", "vouchers or promotions", "top up a wallet", "refund"):
+    for denied in (
+        "take card details itself",
+        "complete an eSIM top-up",
+        "vouchers or promotions",
+        "refund",
+    ):
         assert denied in scope
 
 
@@ -452,6 +516,112 @@ def test_every_tool_has_a_human_title_and_substantial_description(tools: list[To
                 "nothing was charged",
                 "never say it succeeded and never say it failed",
                 "contact",
+            ],
+        ),
+        (
+            "get_esim_consumption",
+            [
+                "when:",
+                # Which SIM, and how to ask when it is unclear. The numbered list is now the
+                # way a user picks one, so the guidance has to name both the list and the
+                # argument that consumes a number from it.
+                "omit both arguments when the user owns exactly one",
+                "numbered list from get_my_esims",
+                "esim_number=2",
+                # One SIM per call: nothing may fan out across an account on its own.
+                "one esim per call",
+                "never call this tool for several esims on your own initiative",
+                # The three ways a model could invent a figure, banned individually.
+                "never adjust a number",
+                "never work one out from a validity date",
+                "never call a figure an estimate",
+                # The empty answer, which is where "0 GB used" would come from.
+                "do not say they have used nothing",
+                "do not say they still have their full allowance",
+                # And an error is never a number.
+                "never turn an error into a number",
+            ],
+        ),
+        (
+            "get_esim_topup_options",
+            [
+                "when:",
+                "reads only",
+                # The rule that stops a catalogue plan being sold as a top-up.
+                "this is the only source of top-up plans",
+                "never offer a plan from find_bundles_by_country",
+                "never present a catalogue plan as a top-up",
+                "short numbered list",
+            ],
+        ),
+        (
+            "prepare_esim_topup",
+            [
+                "this does not top anything up",
+                "creates no order",
+                "adds no data to the sim",
+                "never use a code from the general catalogue",
+                # The ceiling, stated where the model will read it.
+                "cannot complete a top-up",
+                "there is no tool that does",
+                "esim app or on the website",
+                "never say it is reserved, queued, started or paid for",
+            ],
+        ),
+        (
+            "prepare_wallet_topup",
+            [
+                "when:",
+                "this charges nothing",
+                "does not change the user's balance",
+                # The amount is the user's to state, and only theirs.
+                "never choose an amount for them",
+                "never round one",
+                # No card, ever.
+                "never ask for a card number",
+                "nothing here can take a card",
+                # And the confirmation gate.
+                "explicitly agreed to pay it",
+            ],
+        ),
+        (
+            "create_wallet_topup_checkout",
+            [
+                "this charges nothing by itself",
+                "credited only after they pay",
+                "payment webhook",
+                # The confirmation gate, and what does not count as one.
+                "explicitly said",
+                "wanting a quote is not agreeing to pay",
+                # No card, ever.
+                "never ask the user for a card number",
+                "this server never sees a card",
+                # The link is the deliverable.
+                "safe to repeat",
+                "never opens a second page",
+                "result itself is the confirmation",
+                "never answer that you cannot give them a link",
+                # And a lost answer is not a failure.
+                "that is a lost answer, not a refusal",
+            ],
+        ),
+        (
+            "get_wallet_topup_status",
+            [
+                "when:",
+                "only way to know whether the payment went through",
+                "payment webhook",
+                # The four things that are not evidence, named individually.
+                "never treat any of these as proof",
+                "browser redirect",
+                "success screen",
+                "user simply saying it worked",
+                # No polling.
+                "do not call it on a loop",
+                "one check per request",
+                # Every state.
+                "nothing was charged and nothing was credited",
+                "never say it succeeded and never say it failed",
             ],
         ),
     ],
@@ -816,3 +986,54 @@ async def test_a_session_is_only_ended_by_an_explicit_logout_call(
 
     assert logout_route.call_count == 1
     assert (await service.get_login_status())["authenticated"] is False
+
+
+# ------------------------------------------------------- QA eSIM top-up execution guidance
+
+
+def test_the_default_instructions_never_name_the_execution_tool() -> None:
+    """A deployment that cannot execute must not advertise the tool that would."""
+    from esim_mcp.server import build_instructions
+
+    off = build_instructions(execution_enabled=False)
+    assert "confirm_esim_topup" not in off
+    assert "This deployment cannot complete a top-up" in off
+    assert "complete an eSIM top-up" in off.split("Scope:", 1)[1]
+
+
+def test_the_qa_instructions_state_the_three_rules_that_matter() -> None:
+    """Non-idempotent, call once, never retry an unknown outcome, always confirm first."""
+    from esim_mcp.server import build_instructions
+
+    on = build_instructions(execution_enabled=True).lower()
+
+    # Non-idempotent, said in as many words.
+    assert "is not idempotent" in on
+    # Call it once.
+    assert "at most once" in on
+    assert "confirming twice would charge the user twice" in on
+    # Never retry an unknown outcome.
+    assert "never retry an unknown outcome" in on
+    assert "do not confirm again and do not prepare a replacement" in on
+    # Explicit confirmation, and what does not count as one.
+    assert "wait for them to agree explicitly" in on
+    assert "is not agreement" in on
+    # And where to look instead of retrying.
+    for tool in ("get_my_esims", "get_esim_consumption", "get_order_history"):
+        assert tool in on
+
+
+async def test_the_qa_instructions_still_reference_only_published_tools(qa_topup_settings) -> None:
+    """The same guard the default build passes, applied to the QA build."""
+    from esim_mcp.server import build_components, build_instructions
+
+    components = build_components(qa_topup_settings, identity_provider=StubIdentityProvider("client-a"))
+    try:
+        published = {tool.name for tool in await components.server.list_tools()}
+    finally:
+        await components.aclose()
+
+    instructions = build_instructions(execution_enabled=True)
+    referenced = set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", instructions)) - KNOWN_NON_TOOL_TERMS
+    assert referenced <= published
+    assert "confirm_esim_topup" in published

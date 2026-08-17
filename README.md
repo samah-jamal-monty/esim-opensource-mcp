@@ -81,11 +81,60 @@ Implemented:
   `check_card_payment_status` reads what happened to that payment. One idempotency key per
   quote, one page per quote, and **the card never touches this server** — it is entered on
   Stripe's own hosted page, in the user's browser.
+* **Phase 6A** — **live eSIM usage**: `get_esim_consumption` reports the platform's own
+  reading for one eSIM the signed-in user owns — total, used, remaining, plan status and
+  expiry. Every figure is copied from the platform; none is derived from a date, a price or
+  a catalogue allowance, and an empty answer is reported as "nothing yet", never as zero.
+* **Phase 6B** — **eSIM top-up**: `get_esim_topup_options` lists the platform's own
+  compatibility list for one owned eSIM and `prepare_esim_topup` prices one of them. Both are
+  free. `confirm_esim_topup` performs the top-up, but **only in QA** and behind a flag that
+  defaults to off — see *`confirm_esim_topup` is QA-only* below.
+* **Phase 6C** — **wallet top-up**: `prepare_wallet_topup` checks an amount against the
+  platform's own minimum and rolling limits, `create_wallet_topup_checkout` asks the platform
+  to open its Stripe-hosted page and returns the link, and `get_wallet_topup_status` reads
+  what happened. Duplicate protection is the platform's own durable pending-order reuse, and
+  **the card never touches this server**.
 
 **Not implemented, by design:** taking card details here (a Stripe integration of any kind
-beyond passing on the platform's own link), wallet top-ups, promotions, vouchers, DCB,
-refunds or order cancellation, eSIM provisioning, activation, consumption, callbacks and the
-backend's translation/maintenance routes.
+beyond passing on the platform's own link), performing an eSIM top-up *outside QA*, promotions,
+vouchers, DCB, refunds or order cancellation, eSIM provisioning, activation, callbacks and
+the backend's translation/maintenance routes.
+
+### `confirm_esim_topup` is QA-only, and not idempotent
+
+Set `MCP_ESIM_TOP_UP_ENABLED=true` and one more tool appears: `confirm_esim_topup`, which
+performs a **real** top-up over the platform's *legacy* `POST /user/bundle/assign-top-up` —
+the same route the portal uses. **The flag defaults to false and must stay false in
+production.**
+
+The reason is idempotency. A top-up that runs twice costs the user twice and puts data on a
+SIM they did not ask for, and the only honest protection is a *durable* record that lets a
+retry be recognised as the same request. The platform has none: that route accepts no
+idempotency key, and the `Topup` row it writes to `user_order` carries neither an ICCID nor a
+request key, so two identical requests are indistinguishable from one sent twice. It also
+debits the wallet *before* provisioning and swallows a failed provisioning.
+
+**So nothing here tries to make a second request safe. It makes a second request impossible
+instead** — a different and weaker promise:
+
+* one quote, one attempt, whatever the outcome. The attempt is counted *before* the request
+  leaves, under a per-quote lock, so a request that dies in flight still locks the quote;
+* an unknown outcome is terminal. Everywhere else an unresolved write may be presented again
+  with the key it already used; here there is no key, so asking again is a *second top-up*;
+* everything is revalidated against the platform immediately before sending — ownership,
+  compatibility, availability, price, currency, balance, expiry, payment method;
+* the caller must echo the exact amount from the quote, so a confirmation can only come from
+  something that actually read it back;
+* **the lock lives in this process.** A restart between sending and recording loses it. That
+  is exactly why this does not go to production.
+
+Three independent gates rest on the flag, and all three are asserted by tests: the tool is
+not registered, the service refuses, and `enforce_route_is_permitted` refuses the path.
+`Settings` **refuses to construct** when the flag is true and the environment is production,
+so a production process with it set will not start.
+
+Production blocker: durable idempotency (a request-key column or table on `user_order`, which
+is a schema change) plus wallet compensation for a debit whose provisioning failed.
 
 ### Preparation and purchase are two different tools, deliberately
 
@@ -117,16 +166,31 @@ nothing**: the user pays on Stripe's page or they do not, and this server never 
 number either way. `GET /api/v1/mcp/user/bundle/card/status/{payment_reference}` is the read
 that says what happened.
 
-Those two `POST`s are the **only** mutating routes this server may call, allowlisted by exact
-method and path in `PERMITTED_MUTATION_ROUTES` (`src/esim_mcp/client/base.py`). The status
-read ends in a caller-supplied reference, so it cannot be matched exactly; its prefix is
-allowlisted in `PERMITTED_REFERENCE_READ_ROUTES` and the segment after it must be one plain
-opaque token — a path that starts with the prefix and fails that check is refused outright
-rather than falling through to the marker scan.
+`POST /api/v1/mcp/wallet/top-up/checkout` opens the platform's hosted page for a **wallet
+top-up** and returns a link. It moves nothing either: the wallet is credited only after the
+user pays, and only by the platform's own signature-verified Stripe webhook. Duplicate
+protection lives at the platform, which reuses the caller's own pending `user_order` row and
+keys the Stripe call on it — durable across a restart of this process, which is why this
+server mints no key of its own for that route.
+
+Those three `POST`s are the **only** mutating routes this server may call, allowlisted by
+exact method and path in `PERMITTED_MUTATION_ROUTES` (`src/esim_mcp/client/base.py`). Reads
+whose paths end in caller-supplied references cannot be matched exactly; their prefixes are
+allowlisted in `PERMITTED_REFERENCE_READ_ROUTES` together with the exact number of segments
+allowed after them, and every segment must be one plain opaque token — a path that starts
+with a prefix and fails that check is refused outright rather than falling through to the
+marker scan. That covers the two payment-status reads, `GET /user/consumption/{iccid}` and
+`GET /user/related-topup/{bundle_code}/{iccid}`. One fixed read,
+`GET /mcp/wallet/top-up/options`, contains a forbidden marker in its own path and is named
+back in by exact match in `PERMITTED_EXACT_READ_ROUTES`.
 
 The whole `bundle/card` family is a forbidden marker, exactly like `bundle/assign`, with the
 two members above allowlisted back. A `card/capture`, a `card/refund` or a future
-`card/confirm` route is therefore unreachable by construction rather than by omission.
+`card/confirm` route is therefore unreachable by construction rather than by omission. The
+same treatment now covers `top-up` and `topup`: the whole family is banned and the four
+routes named above are allowlisted back, so `/mcp/user/bundle/topup`, a future
+`/wallet/credit` or any other top-up route is unreachable simply by not spelling a banned
+word.
 
 The *legacy* `POST /api/v1/user/bundle/assign` stays forbidden and always will be: it has
 no idempotency key and no duplicate-order protection, so a retried call there can buy a plan
@@ -905,7 +969,10 @@ plan. Bundles the backend marks `is_active: false` are dropped from every list, 
 | `ESIM_MCP_DEFAULT_LOCALE` | `en` | Sent as `Accept-Language` |
 | `ESIM_MCP_DEFAULT_CURRENCY` | `USD` | Sent as `X-Currency` |
 | `ESIM_MCP_CONNECT_TIMEOUT` | `5` | Seconds |
-| `ESIM_MCP_READ_TIMEOUT` | `20` | Seconds |
+| `ESIM_MCP_READ_TIMEOUT` | `20` | Seconds. The general read budget, sized for cached catalogue lookups |
+| `ESIM_MCP_ACCOUNT_READ_TIMEOUT` | `120` | Seconds. `get_my_esims` and `get_order_history` only — see below |
+| `ESIM_MCP_CHECKOUT_READ_TIMEOUT` | `45` | Seconds. The card-checkout `POST` only |
+| `ESIM_MCP_PURCHASE_READ_TIMEOUT` | `90` | Seconds. The wallet-purchase `POST` only |
 | `ESIM_MCP_WRITE_TIMEOUT` | `20` | Seconds |
 | `ESIM_MCP_POOL_TIMEOUT` | `5` | Seconds |
 | `ESIM_MCP_TOKEN_REFRESH_WINDOW_SECONDS` | `120` | Refresh this long before `exp` |
@@ -917,6 +984,39 @@ plan. Bundles the backend marks `is_active: false` are dropped from every list, 
 
 Only these prefixed names are read by the settings model, so a platform-provided `HOST`,
 `ENVIRONMENT` or `LOG_LEVEL` cannot silently reconfigure the server.
+
+### Read budgets are per-route, never global
+
+There are four, and widening one never widens another. `ESIM_MCP_READ_TIMEOUT` is the general
+one and it is sized for what most of this server does: cached catalogue lookups that answer in
+well under a second. The other three exist because three specific routes do far more work than
+that, and each is applied to its own route and to nothing else.
+
+`ESIM_MCP_ACCOUNT_READ_TIMEOUT` covers the two authenticated account-history reads —
+`GET /api/v1/user/my-esim` behind `get_my_esims`, and `GET /api/v1/user/order-history` behind
+`get_order_history`. Neither is cached: the platform builds the answer per user and per
+request, re-reading every bundle the account owns and re-localizing every row, so the time it
+takes grows with the account. On a real account that ran past the 20-second general budget
+while the portal — which imposes no budget of its own — got the same answer and rendered it.
+The default of `120` is deliberately well clear of the measured latency rather than tight
+against it.
+
+Two rules go with that budget, and both are enforced in code:
+
+- **One attempt.** These two reads do not use the shared three-attempt read retry. Three
+  attempts at a two-minute budget is six minutes of a chat client waiting to be told the
+  platform was slow. One request goes out per tool call, and one answer or one typed timeout
+  comes back.
+- **A timeout is not an empty account, and not an authentication failure.** A read that runs
+  out of budget raises the typed `account_read_timeout` error, which says in words that the
+  account was not read rather than that it is empty. The access token is not refreshed, the
+  read is not replayed, and nothing retries on its own. Only a real `401` from the platform
+  causes a refresh, and that refresh replays the read exactly once.
+
+`ESIM_MCP_CHECKOUT_READ_TIMEOUT` and `ESIM_MCP_PURCHASE_READ_TIMEOUT` are the two payment
+budgets and are unrelated to the above; see the purchase and card-checkout sections for why
+they are sized the way they are. Changing the account budget leaves both untouched, and
+changing either of them leaves the account budget untouched.
 
 The one deliberate exception is the listening port, and it lives in the HTTP entry point
 (`esim_mcp/http_app.py`) rather than in the settings model: `ESIM_MCP_PORT` > a

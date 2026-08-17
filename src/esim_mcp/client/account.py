@@ -5,11 +5,33 @@ Both are existing backend routes, unchanged and unextended by this server:
 * ``GET /user/my-esim`` -- every eSIM belonging to the caller, from the bearer token alone;
 * ``GET /user/order-history`` -- the caller's own orders, paginated by the backend.
 
-Both are reads, so both use the shared bounded retry policy
-(:meth:`~esim_mcp.client.base.BackendApiClient.request`, ``allow_retry=True``). Neither
-creates, cancels or alters anything, and neither takes an identifier from the model: the user
-is resolved from the verified bearer token on the backend side, so there is no parameter here
-through which one MCP user could read another's eSIMs or orders.
+Neither creates, cancels or alters anything, and neither takes an identifier from the model:
+the user is resolved from the verified bearer token on the backend side, so there is no
+parameter here through which one MCP user could read another's eSIMs or orders.
+
+Why these two reads are timed and retried differently from every other read
+---------------------------------------------------------------------------
+Every other ``GET`` this server makes is a catalogue lookup the platform serves from a cache,
+and :attr:`~esim_mcp.settings.Settings.read_timeout` is sized for those. These two are not
+cached: the platform builds each answer per user and per request, re-reading every bundle the
+account owns and re-localizing every row. On a real account that ran past the general budget,
+while the portal -- which imposes none -- got the same answer.
+
+So both reads use :attr:`~esim_mcp.settings.Settings.account_read_timeout` instead, and both
+take **exactly one attempt** (``allow_retry=False``). The two go together. The shared retry
+policy is three attempts, and three attempts at a two-minute budget is six minutes of a chat
+client waiting to be told the platform was slow -- which is exactly the failure this module
+exists to stop. One attempt in, one answer or one typed timeout out.
+
+A timeout here is raised as :class:`~esim_mcp.errors.AccountReadTimeoutError` rather than the
+generic :class:`~esim_mcp.errors.BackendTimeoutError`, because the one thing that must never
+happen to it is being read as "this account owns nothing". It is a subclass, so every
+existing handler still catches it.
+
+Nothing here treats a timeout as an authentication problem. A timeout is not an
+:class:`~esim_mcp.errors.AuthenticationRequiredError`, so it never reaches the session
+manager's refresh-and-replay branch: the token is not rotated and the read is not repeated.
+Only a real ``401`` does that, exactly once.
 
 Deliberately absent, and not to be added to this module
 ------------------------------------------------------
@@ -32,6 +54,7 @@ from typing import Any
 from pydantic import SecretStr
 
 from esim_mcp.client.base import BackendApiClient, RequestCredentials
+from esim_mcp.errors import AccountReadTimeoutError, BackendTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +80,11 @@ class AccountApiClient:
     def __init__(self, client: BackendApiClient) -> None:
         self._client = client
 
+    @property
+    def _read_timeout(self) -> float:
+        """The configured budget for these two reads. Read per call, never cached here."""
+        return self._client.settings.account_read_timeout
+
     async def get_my_esims(
         self,
         *,
@@ -69,16 +97,25 @@ class AccountApiClient:
 
         The envelope's ``data`` is a list, or ``null`` for an account that owns none. Both are
         successful answers and neither is an error.
+
+        One attempt, on the account budget. A timeout raises
+        :class:`~esim_mcp.errors.AccountReadTimeoutError` and nothing else happens: no second
+        request, no token rotation, no empty list.
         """
-        return await self._client.request(
-            "GET",
-            MY_ESIM_PATH,
-            device_id=device_id,
-            locale=locale,
-            currency=currency,
-            credentials=RequestCredentials(access_token=access_token),
-            allow_retry=True,
-        )
+        try:
+            return await self._client.request(
+                "GET",
+                MY_ESIM_PATH,
+                device_id=device_id,
+                locale=locale,
+                currency=currency,
+                credentials=RequestCredentials(access_token=access_token),
+                allow_retry=False,
+                read_timeout=self._read_timeout,
+            )
+        except BackendTimeoutError:
+            logger.warning("my_esim_read_timeout", extra={"read_timeout_seconds": self._read_timeout})
+            raise AccountReadTimeoutError() from None
 
     async def get_order_history(
         self,
@@ -95,14 +132,23 @@ class AccountApiClient:
         ``page_index`` and ``page_size`` are the backend's query parameters, passed through
         under their real names rather than re-implemented here, so paging behaves exactly as
         it does for the website and the mobile app.
+
+        Timed and retried exactly as :meth:`get_my_esims` is, and for the same reasons: the
+        platform builds this page per user too, and "the platform was slow" must never reach
+        a user as "you have never ordered anything".
         """
-        return await self._client.request(
-            "GET",
-            ORDER_HISTORY_PATH,
-            device_id=device_id,
-            params={"page_index": page_index, "page_size": page_size},
-            locale=locale,
-            currency=currency,
-            credentials=RequestCredentials(access_token=access_token),
-            allow_retry=True,
-        )
+        try:
+            return await self._client.request(
+                "GET",
+                ORDER_HISTORY_PATH,
+                device_id=device_id,
+                params={"page_index": page_index, "page_size": page_size},
+                locale=locale,
+                currency=currency,
+                credentials=RequestCredentials(access_token=access_token),
+                allow_retry=False,
+                read_timeout=self._read_timeout,
+            )
+        except BackendTimeoutError:
+            logger.warning("order_history_read_timeout", extra={"read_timeout_seconds": self._read_timeout})
+            raise AccountReadTimeoutError() from None

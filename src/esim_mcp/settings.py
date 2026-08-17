@@ -110,6 +110,27 @@ class Settings(BaseSettings):
     purchase_read_timeout: float = Field(
         default=90.0, gt=0, le=300, validation_alias="ESIM_MCP_PURCHASE_READ_TIMEOUT"
     )
+    #: Read budget for the two authenticated account-history GETs -- ``/user/my-esim`` and
+    #: ``/user/order-history`` -- and for nothing else.
+    #:
+    #: Unlike every other read this server makes, neither of these is a cached catalogue
+    #: lookup. The platform builds them per user and per request: it loads the caller's
+    #: profiles, re-reads each bundle, re-runs its own related-search and re-localizes every
+    #: row before it answers. That work scales with how much the account owns, and on a
+    #: measured production account it ran well past the 20-second general budget while the
+    #: portal -- which has no such budget -- got the same answer and rendered it.
+    #:
+    #: Failing here is not neutral either, though for a different reason from the checkout
+    #: budgets below. Nothing is being created, so nothing is lost -- but the *shape* of the
+    #: failure is dangerous: "the platform did not answer in time" is one word away from "you
+    #: own no eSIMs", and a model that collapses the two tells a paying user their SIM does
+    #: not exist. That is why the budget is generous, why the timeout gets its own error type
+    #: (:class:`~esim_mcp.errors.AccountReadTimeoutError`), and why these two reads take
+    #: exactly one attempt rather than the shared three: three attempts at this budget would
+    #: hold a chat client for six minutes to say the same thing.
+    account_read_timeout: float = Field(
+        default=120.0, gt=0, le=300, validation_alias="ESIM_MCP_ACCOUNT_READ_TIMEOUT"
+    )
     write_timeout: float = Field(default=20.0, gt=0, le=300, validation_alias="ESIM_MCP_WRITE_TIMEOUT")
     pool_timeout: float = Field(default=5.0, gt=0, le=300, validation_alias="ESIM_MCP_POOL_TIMEOUT")
     token_refresh_window_seconds: int = Field(
@@ -128,6 +149,21 @@ class Settings(BaseSettings):
     max_active_quotes_per_user: int = Field(
         default=5, ge=1, le=50, validation_alias="ESIM_MCP_MAX_ACTIVE_QUOTES_PER_USER"
     )
+    #: **QA-only.** Enables ``confirm_esim_topup``, which performs a real eSIM top-up over
+    #: the platform's *legacy* ``POST /user/bundle/assign-top-up`` route.
+    #:
+    #: That route is **not idempotent**: it accepts no idempotency key, and the ``Topup`` row
+    #: it writes carries neither an ICCID nor a request key, so the platform cannot tell a
+    #: retry apart from a second genuine request. It also debits the wallet *before*
+    #: provisioning, and swallows a failed provisioning. A repeated call therefore charges
+    #: the user twice, and no code in this server or in the platform can prevent that.
+    #:
+    #: The flag defaults to **off** and :meth:`_enforce_production_safety` refuses to
+    #: construct settings at all when it is on in production, so the capability cannot reach
+    #: a production deployment by configuration drift. Three independent gates rest on it:
+    #: the tool is not registered, the service refuses, and the transport refuses the route.
+    esim_topup_execution_enabled: bool = Field(default=False, validation_alias="MCP_ESIM_TOP_UP_ENABLED")
+
     log_level: LogLevel = Field(default="INFO", validation_alias="ESIM_MCP_LOG_LEVEL")
 
     #: Identity handed to stdio/local callers when no authenticated transport principal
@@ -176,6 +212,17 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _enforce_production_safety(self) -> Settings:
         if self.is_production:
+            if self.esim_topup_execution_enabled:
+                # Deliberately fatal rather than silently downgraded. This flag turns on a
+                # non-idempotent write that can charge a user twice, and it exists only so
+                # QA can exercise the flow end to end. A production deployment that sets it
+                # must fail to start, loudly, rather than serve one request with it on.
+                raise ValueError(
+                    "MCP_ESIM_TOP_UP_ENABLED must be false in production: it enables a "
+                    "non-idempotent eSIM top-up that can charge a user twice. It is a QA-only "
+                    "flag and stays that way until the platform provides durable idempotency "
+                    "and wallet compensation."
+                )
             if not self.api_base_url.startswith("https://"):
                 raise ValueError("ESIM_API_BASE_URL must use https:// in production")
             salt = self.device_id_salt.get_secret_value() if self.device_id_salt else ""

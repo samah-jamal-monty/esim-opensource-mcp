@@ -43,15 +43,77 @@ from starlette.routing import Route
 
 from esim_mcp.http_app import MCP_PATH, create_app
 from esim_mcp.settings import Settings
-from tests.conftest import CATALOG_REGIONS, TEST_SALT, bundle_payload, envelope, make_jwt
+from tests.conftest import (
+    CATALOG_REGIONS,
+    TEST_SALT,
+    bundle_payload,
+    consumption_payload,
+    envelope,
+    esim_payload,
+    make_jwt,
+    topup_bundle_payload,
+    topup_options_payload,
+    wallet_topup_checkout_payload,
+    wallet_topup_status_payload,
+)
 
 pytestmark = pytest.mark.anyio
 
 #: Two distinct eSIM accounts, so "B saw A's account" is observable rather than inferred.
 ACCOUNTS: dict[str, dict[str, Any]] = {
-    "alice@example.com": {"first_name": "Alice", "balance": 111.0, "subject": "user-alice"},
-    "bob@example.com": {"first_name": "Bob", "balance": 222.0, "subject": "user-bob"},
+    "alice@example.com": {
+        "first_name": "Alice",
+        "balance": 111.0,
+        "subject": "user-alice",
+        # One eSIM per account, with a distinct ICCID, distinct usage and a distinct top-up
+        # reference. That is what makes a cross-user read *observable* rather than inferred:
+        # if a client is served somebody else's session it reads somebody else's numbers.
+        "iccid": "8931080019111111111",
+        "used": 1.0,
+        "topup_reference": "topup-alice-0001",
+        "topup_order": "ord-topup-alice",
+    },
+    "bob@example.com": {
+        "first_name": "Bob",
+        "balance": 222.0,
+        "subject": "user-bob",
+        "iccid": "8931080019222222222",
+        "used": 2.0,
+        "topup_reference": "topup-bob-0001",
+        "topup_order": "ord-topup-bob",
+    },
+    "carol@example.com": {
+        "first_name": "Carol",
+        "balance": 333.0,
+        "subject": "user-carol",
+        "iccid": "8931080019333333333",
+        "used": 3.0,
+        "topup_reference": "topup-carol-0001",
+        "topup_order": "ord-topup-carol",
+    },
+    "dave@example.com": {
+        "first_name": "Dave",
+        "balance": 444.0,
+        "subject": "user-dave",
+        "iccid": "8931080019444444444",
+        "used": 4.0,
+        "topup_reference": "topup-dave-0001",
+        "topup_order": "ord-topup-dave",
+    },
+    "erin@example.com": {
+        "first_name": "Erin",
+        "balance": 555.0,
+        "subject": "user-erin",
+        "iccid": "8931080019555555555",
+        "used": 5.0,
+        "topup_reference": "topup-erin-0001",
+        "topup_order": "ord-topup-erin",
+    },
 }
+
+#: The plan on every stub eSIM, so the top-up compatibility route has something to key on.
+PRIMARY_BUNDLE = "aaaaaaaa-0000-4000-8000-000000000001"
+TOPUP_BUNDLE = "tttttttt-0000-4000-8000-000000000001"
 
 
 @pytest.fixture
@@ -93,6 +155,14 @@ class StubBackend:
         self.refreshes: list[str] = []
         self._device_ids: list[str] = []
         self.region_device_ids: list[str] = []
+        #: Every checkout the stub opened, by account. A second entry for one account means
+        #: a duplicate page was created.
+        self.checkouts: list[str] = []
+        #: Every eSIM top-up the stub executed, by account. A second entry for one account
+        #: means somebody was charged twice -- the failure this whole design exists to stop.
+        self.topups: list[str] = []
+        #: Device ids seen on the Phase 6 routes specifically.
+        self.phase_six_device_ids: list[str] = []
 
     def app(self) -> Starlette:
         return Starlette(
@@ -105,6 +175,26 @@ class StubBackend:
                 Route("/api/v1/auth/logout", self._logout, methods=["POST"]),
                 Route("/api/v1/bundles/region", self._regions, methods=["GET"]),
                 Route("/api/v1/bundles/by-region/{region_code}", self._bundles_by_region, methods=["GET"]),
+                # Phase 6. Every one of these is token-scoped, exactly as the real backend
+                # is: the account is resolved from the bearer and from nothing else, so a
+                # client holding the wrong token reads the wrong account back and the test
+                # sees it.
+                Route("/api/v1/wallet/user_wallet_by_user", self._wallet, methods=["GET"]),
+                Route("/api/v1/user/my-esim", self._my_esims, methods=["GET"]),
+                Route("/api/v1/user/consumption/{iccid}", self._consumption, methods=["GET"]),
+                Route(
+                    "/api/v1/user/related-topup/{bundle_code}/{iccid}",
+                    self._related_topup,
+                    methods=["GET"],
+                ),
+                Route("/api/v1/user/bundle/assign-top-up", self._execute_topup, methods=["POST"]),
+                Route("/api/v1/mcp/wallet/top-up/options", self._topup_options, methods=["GET"]),
+                Route("/api/v1/mcp/wallet/top-up/checkout", self._topup_checkout, methods=["POST"]),
+                Route(
+                    "/api/v1/mcp/wallet/top-up/status/{payment_reference}",
+                    self._topup_status,
+                    methods=["GET"],
+                ),
             ]
         )
 
@@ -194,6 +284,117 @@ class StubBackend:
         return JSONResponse(envelope(bundles, total_count=len(bundles)))
 
 
+    # ------------------------------------------------------- phase 6: usage and top-ups
+
+    def _authenticated(self, request: Request) -> str | None:
+        """The account this bearer belongs to, recording the device id on the way through."""
+        self._record(request)
+        device_id = request.headers.get("x-device-id")
+        if device_id:
+            self.phase_six_device_ids.append(device_id)
+        return self._email_for(request)
+
+    @staticmethod
+    def _unauthorized() -> JSONResponse:
+        return JSONResponse(envelope(None, status="failed", response_code=401), status_code=401)
+
+    async def _wallet(self, request: Request) -> JSONResponse:
+        """Each account's own balance, keyed on the bearer and on nothing else."""
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        return JSONResponse(envelope({"balance": ACCOUNTS[email]["balance"], "currency": "USD"}))
+
+    async def _my_esims(self, request: Request) -> JSONResponse:
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        return JSONResponse(envelope([esim_payload(iccid=ACCOUNTS[email]["iccid"], bundle_code=PRIMARY_BUNDLE)]))
+
+    async def _consumption(self, request: Request) -> JSONResponse:
+        """Scoped exactly as the real route is: the ICCID must be *this* caller's."""
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        if request.path_params["iccid"] != ACCOUNTS[email]["iccid"]:
+            return JSONResponse(
+                envelope(None, status="failed", title="USER_PROFILE_NOT_FOUND", response_code=400),
+                status_code=400,
+            )
+        return JSONResponse(envelope(consumption_payload(data_used=ACCOUNTS[email]["used"])))
+
+    async def _related_topup(self, request: Request) -> JSONResponse:
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        if request.path_params["iccid"] != ACCOUNTS[email]["iccid"]:
+            return JSONResponse(
+                envelope(None, status="failed", title="REQUEST_FAILED", response_code=400), status_code=400
+            )
+        return JSONResponse(envelope([topup_bundle_payload(bundle_code=TOPUP_BUNDLE)]))
+
+    async def _execute_topup(self, request: Request) -> JSONResponse:
+        """The legacy top-up route, scoped to the bearer exactly as the real one is not.
+
+        The real platform does **not** check ICCID ownership here -- that gap is one of the
+        accepted QA risks. The stub checks it anyway, so a test that got the ownership
+        boundary wrong on the MCP side fails loudly here instead of silently passing.
+        """
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        body = await request.json()
+        if body.get("iccid") != ACCOUNTS[email]["iccid"]:
+            return JSONResponse(
+                envelope(None, status="failed", title="REQUEST_FAILED", response_code=400), status_code=400
+            )
+        self.topups.append(email)
+        return JSONResponse(
+            envelope({"order_id": ACCOUNTS[email]["topup_order"], "payment_status": "COMPLETED"})
+        )
+
+    async def _topup_options(self, request: Request) -> JSONResponse:
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        return JSONResponse(
+            envelope(topup_options_payload(current_balance=f"{ACCOUNTS[email]['balance']:.2f}"))
+        )
+
+    async def _topup_checkout(self, request: Request) -> JSONResponse:
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        reference = ACCOUNTS[email]["topup_reference"]
+        # The durable guarantee the real platform gives, modelled: a repeat of the same
+        # top-up resolves onto the order that already exists rather than a second one.
+        replay = reference in self.checkouts
+        self.checkouts.append(reference)
+        return JSONResponse(
+            envelope(
+                wallet_topup_checkout_payload(
+                    payment_reference=reference,
+                    checkout_url=f"https://checkout.test/pay/{reference}",
+                    idempotent_replay=replay,
+                )
+            )
+        )
+
+    async def _topup_status(self, request: Request) -> JSONResponse:
+        """Scoped to the caller: another account's reference is *not found*, not refused."""
+        email = self._authenticated(request)
+        if email is None:
+            return self._unauthorized()
+        if request.path_params["payment_reference"] != ACCOUNTS[email]["topup_reference"]:
+            return JSONResponse(
+                envelope(None, status="failed", title="MCP_WALLET_TOPUP_NOT_FOUND", response_code=404),
+                status_code=404,
+            )
+        return JSONResponse(
+            envelope(wallet_topup_status_payload(payment_reference=ACCOUNTS[email]["topup_reference"]))
+        )
+
+
 def _free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -230,7 +431,13 @@ async def two_clients(_unused: Any = None) -> AsyncIterator[tuple[ClientSession,
 
 
 @asynccontextmanager
-async def one_server() -> AsyncIterator[tuple[str, StubBackend]]:
+async def one_server(*, qa_topup: bool = False) -> AsyncIterator[tuple[str, StubBackend]]:
+    """One real MCP server process over Streamable HTTP.
+
+    ``qa_topup`` turns on the QA eSIM-top-up execution flag, which is what registers
+    ``confirm_esim_topup`` and what opens the legacy route at the transport. It defaults to
+    off, so every test that can charge somebody has to ask for it explicitly.
+    """
     backend = StubBackend()
     backend_port = _free_port()
     mcp_port = _free_port()
@@ -241,6 +448,7 @@ async def one_server() -> AsyncIterator[tuple[str, StubBackend]]:
         transport="streamable-http",
         device_id_salt=TEST_SALT,
         host="127.0.0.1",
+        esim_topup_execution_enabled=qa_topup,
     )
     backend_server = _serve(backend.app(), backend_port)
     mcp_server = _serve(create_app(settings), mcp_port)
@@ -482,3 +690,416 @@ async def test_a_third_client_starts_unauthenticated_while_two_are_signed_in() -
 
         async with mcp_client(url) as client_c:
             assert (await call(client_c, "get_login_status"))["authenticated"] is False
+
+
+# ------------------------------------------------------- phase 6: usage, top-ups, wallet
+#
+# Everything below drives the *new* tools through the same two real connections. The stub
+# platform scopes every one of these routes to the bearer it is given, so a client that
+# ended up holding another client's token would read that other account's SIM, that other
+# account's usage or that other account's payment -- and each test asserts it does not.
+
+
+PHASE_SIX_TOOLS_NEEDING_A_SESSION = (
+    ("get_esim_consumption", {}),
+    ("get_esim_topup_options", {}),
+    ("prepare_esim_topup", {"bundle_code": TOPUP_BUNDLE}),
+    ("prepare_wallet_topup", {"amount": "25"}),
+    ("create_wallet_topup_checkout", {"quote_reference": "anything"}),
+    ("get_wallet_topup_status", {"payment_reference": "anything"}),
+)
+
+
+@pytest.mark.parametrize(("tool", "arguments"), PHASE_SIX_TOOLS_NEEDING_A_SESSION)
+async def test_every_phase_six_tool_is_refused_for_a_client_that_never_signed_in(
+    tool: str, arguments: dict[str, Any]
+) -> None:
+    """Fail closed, tool by tool, while another client is signed in on the same process."""
+    async with two_clients() as (client_a, client_b, _):
+        await sign_in(client_a, "alice@example.com")
+
+        result = await call(client_b, tool, **arguments)
+
+        assert isinstance(result, str), f"{tool} served an unauthenticated client"
+        assert "authentication_required" in result, f"{tool} -> {result}"
+        assert "Alice" not in result
+
+
+async def test_two_users_read_their_own_usage_and_never_each_others() -> None:
+    """A and B each own one SIM with different usage. Neither may see the other's."""
+    async with two_clients() as (client_a, client_b, backend):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+
+        usage_a = await call(client_a, "get_esim_consumption")
+        usage_b = await call(client_b, "get_esim_consumption")
+
+        assert usage_a["usage"]["used_data"] == "1.0 GB"
+        assert usage_b["usage"]["used_data"] == "2.0 GB"
+        # The SIMs are named by different masked identifiers, so neither answer is the other.
+        assert usage_a["esim"]["masked_iccid"] != usage_b["esim"]["masked_iccid"]
+        # And two device identities reached the platform, not one.
+        assert len(set(backend.phase_six_device_ids)) == 2
+
+
+async def test_one_user_cannot_name_another_users_iccid() -> None:
+    """The ownership boundary, over the real transport.
+
+    A asks for B's ICCID by name. It is not in A's own eSIM list, so it is *not found* --
+    and, critically, the request never reaches the platform at all.
+    """
+    async with two_clients() as (client_a, client_b, backend):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+        bobs_iccid = ACCOUNTS["bob@example.com"]["iccid"]
+
+        for tool in ("get_esim_consumption", "get_esim_topup_options"):
+            result = await call(client_a, tool, iccid=bobs_iccid)
+            assert isinstance(result, str), f"{tool} served a foreign ICCID"
+            assert "esim_not_found" in result
+            assert bobs_iccid not in result
+
+        assert not any(bobs_iccid in path for path in backend.phase_six_device_ids)
+
+
+async def test_a_top_up_quote_of_one_user_is_invisible_to_another() -> None:
+    async with two_clients() as (client_a, client_b, _):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+
+        prepared = await call(client_a, "prepare_esim_topup", bundle_code=TOPUP_BUNDLE)
+        assert prepared["status"] == "prepared"
+
+        stolen = await call(client_b, "get_prepared_esim_topup", quote_id=prepared["quote_id"])
+
+        assert isinstance(stolen, str)
+        assert "topup_quote_not_found" in stolen
+
+
+async def test_one_user_cannot_create_or_inspect_another_users_wallet_payment() -> None:
+    """The money half of the isolation story: neither the quote nor the reference travels."""
+    async with two_clients() as (client_a, client_b, backend):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+
+        quote_a = await call(client_a, "prepare_wallet_topup", amount="25")
+        opened_a = await call(client_a, "create_wallet_topup_checkout", quote_reference=quote_a["quote_reference"])
+        assert opened_a["checkout_url"].endswith("topup-alice-0001")
+
+        # B cannot open a page for A's quote...
+        hijacked = await call(client_b, "create_wallet_topup_checkout", quote_reference=quote_a["quote_reference"])
+        assert isinstance(hijacked, str)
+        assert "wallet_topup_quote_not_found" in hijacked
+
+        # ...and cannot read A's payment either.
+        probed = await call(client_b, "get_wallet_topup_status", payment_reference=opened_a["payment_reference"])
+        assert isinstance(probed, str)
+        assert "wallet_topup_not_found" in probed
+
+        # Exactly one page was opened, for Alice, and nobody else's reference was used.
+        assert backend.checkouts == ["topup-alice-0001"]
+
+
+async def test_each_user_sees_their_own_balance_in_their_own_top_up_quote() -> None:
+    async with two_clients() as (client_a, client_b, _):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+
+        quote_a = await call(client_a, "prepare_wallet_topup", amount="25")
+        quote_b = await call(client_b, "prepare_wallet_topup", amount="25")
+
+        assert quote_a["current_balance"] == "111.00"
+        assert quote_b["current_balance"] == "222.00"
+
+
+async def test_a_repeated_checkout_returns_one_page_per_user() -> None:
+    """Two users, two pages. One user asking twice, one page."""
+    async with two_clients() as (client_a, client_b, backend):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+
+        quote_a = await call(client_a, "prepare_wallet_topup", amount="25")
+        quote_b = await call(client_b, "prepare_wallet_topup", amount="25")
+
+        first_a = await call(client_a, "create_wallet_topup_checkout", quote_reference=quote_a["quote_reference"])
+        again_a = await call(client_a, "create_wallet_topup_checkout", quote_reference=quote_a["quote_reference"])
+        only_b = await call(client_b, "create_wallet_topup_checkout", quote_reference=quote_b["quote_reference"])
+
+        assert first_a["checkout_url"] == again_a["checkout_url"]
+        assert again_a["replayed"] is True
+        assert only_b["checkout_url"] != first_a["checkout_url"]
+        # A's repeat was replayed locally, so the platform saw one checkout per user.
+        assert backend.checkouts == ["topup-alice-0001", "topup-bob-0001"]
+
+
+async def test_logging_out_drops_that_users_usage_top_up_and_payment_access_only() -> None:
+    async with two_clients() as (client_a, client_b, _):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+        quote_a = await call(client_a, "prepare_wallet_topup", amount="25")
+        opened_a = await call(client_a, "create_wallet_topup_checkout", quote_reference=quote_a["quote_reference"])
+
+        await call(client_a, "logout")
+
+        # A's payment reference and quote are gone with the session.
+        gone = await call(client_a, "get_wallet_topup_status", payment_reference=opened_a["payment_reference"])
+        assert isinstance(gone, str) and "authentication_required" in gone
+        # B is untouched, and still reads B's own usage.
+        assert (await call(client_b, "get_esim_consumption"))["usage"]["used_data"] == "2.0 GB"
+
+
+async def test_a_token_refresh_on_one_session_leaves_the_others_usage_unchanged() -> None:
+    async with two_clients() as (client_a, client_b, backend):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+        usage_b_before = await call(client_b, "get_esim_consumption")
+
+        # Force A's session to rotate by expiring its access token platform-side.
+        backend.tokens = {
+            token: email for token, email in backend.tokens.items() if email != "alice@example.com"
+        }
+        usage_a = await call(client_a, "get_esim_consumption")
+
+        assert backend.refreshes == ["alice@example.com"], "the wrong session was refreshed"
+        assert usage_a["usage"]["used_data"] == "1.0 GB"
+        assert await call(client_b, "get_esim_consumption") == usage_b_before
+
+
+async def test_a_reconnecting_client_fails_closed_rather_than_inheriting_a_session() -> None:
+    """A new connection is a new caller. It gets no usage, no quote and no payment.
+
+    This is the reconnect half of the reported defect: the MCP session id is minted per
+    connection, so the identity a reconnect resolves to has never been seen before -- and
+    everything keyed on it is therefore empty rather than somebody else's.
+    """
+    async with one_server() as (url, backend):
+        async with mcp_client(url) as first:
+            await sign_in(first, "alice@example.com")
+            quote = await call(first, "prepare_wallet_topup", amount="25")
+            opened = await call(first, "create_wallet_topup_checkout", quote_reference=quote["quote_reference"])
+            assert (await call(first, "get_esim_consumption"))["usage_reported"] is True
+
+        # The first connection is closed. A brand-new one is nobody.
+        async with mcp_client(url) as reconnected:
+            assert (await call(reconnected, "get_login_status"))["authenticated"] is False
+            for tool, arguments in (
+                ("get_esim_consumption", {}),
+                ("get_esim_topup_options", {}),
+                ("get_wallet_topup_status", {"payment_reference": opened["payment_reference"]}),
+                ("create_wallet_topup_checkout", {"quote_reference": quote["quote_reference"]}),
+            ):
+                result = await call(reconnected, tool, **arguments)
+                assert isinstance(result, str), f"{tool} served a reconnected client"
+                assert "authentication_required" in result
+
+        assert backend.checkouts == ["topup-alice-0001"], "a reconnect opened a second payment page"
+
+
+# --------------------------------------------------------------------- five concurrent users
+
+
+async def test_five_concurrent_users_never_cross_over() -> None:
+    """Five real connections, five accounts, all traffic interleaved.
+
+    Every account has its own balance, its own ICCID, its own usage figure and its own
+    payment reference, so a single crossed session shows up as a wrong number rather than
+    as a subtle timing artefact.
+    """
+    emails = list(ACCOUNTS)
+    async with (
+        one_server() as (url, backend), mcp_client(url) as c1,
+        mcp_client(url) as c2,
+        mcp_client(url) as c3,
+        mcp_client(url) as c4,
+        mcp_client(url) as c5,
+    ):
+        clients = [c1, c2, c3, c4, c5]
+        await asyncio.gather(*(sign_in(client, email) for client, email in zip(clients, emails, strict=True)))
+
+        profiles, usages, quotes = await asyncio.gather(
+            asyncio.gather(*(call(client, "get_user_profile") for client in clients)),
+            asyncio.gather(*(call(client, "get_esim_consumption") for client in clients)),
+            asyncio.gather(*(call(client, "prepare_wallet_topup", amount="25") for client in clients)),
+        )
+
+        for email, profile, usage, quote in zip(emails, profiles, usages, quotes, strict=True):
+            account = ACCOUNTS[email]
+            assert profile["user"]["first_name"] == account["first_name"]
+            assert profile["wallet"]["balance"] == account["balance"]
+            assert usage["usage"]["used_data"] == f"{account['used']} GB"
+            assert quote["current_balance"] == f"{account['balance']:.2f}"
+
+        # Five connections, five device identities.
+        assert len(set(backend.phase_six_device_ids)) == 5
+
+        # Each opens a payment page, concurrently. Five pages, one per account.
+        opened = await asyncio.gather(
+            *(
+                call(client, "create_wallet_topup_checkout", quote_reference=quote["quote_reference"])
+                for client, quote in zip(clients, quotes, strict=True)
+            )
+        )
+        references = [result["payment_reference"] for result in opened]
+        assert sorted(references) == sorted(ACCOUNTS[email]["topup_reference"] for email in emails)
+        assert len(set(references)) == 5
+        assert sorted(backend.checkouts) == sorted(references)
+
+        # And no client can read any other client's payment.
+        for index, client in enumerate(clients):
+            for other, reference in enumerate(references):
+                result = await call(client, "get_wallet_topup_status", payment_reference=reference)
+                if index == other:
+                    assert result["payment_reference"] == reference
+                else:
+                    assert isinstance(result, str) and "wallet_topup_not_found" in result
+
+
+# ------------------------------------------------- QA eSIM top-up execution, multi-user
+#
+# `confirm_esim_topup` is registered only when the QA flag is on, so these are the only
+# tests in this file that stand a server up with `qa_topup=True`. The stub platform records
+# every top-up it executes by account: a second entry for one account is a user charged
+# twice, which is the failure the whole design exists to stop.
+
+
+async def confirm_own_topup(session: ClientSession) -> dict[str, Any] | str:
+    """Prepare and confirm one top-up for whichever account this client is signed in as."""
+    quote = await call(session, "prepare_esim_topup", bundle_code=TOPUP_BUNDLE)
+    assert isinstance(quote, dict), quote
+    return await call(
+        session,
+        "confirm_esim_topup",
+        quote_id=quote["quote_id"],
+        confirmed_amount=quote["confirm_amount"],
+    )
+
+
+async def test_the_execution_tool_is_absent_without_the_qa_flag() -> None:
+    """The default deployment does not publish it at all, so a model cannot call it."""
+    async with one_server() as (url, _), mcp_client(url) as client:
+        tools = await client.list_tools()
+        names = {tool.name for tool in tools.tools}
+
+    assert "confirm_esim_topup" not in names
+    assert "prepare_esim_topup" in names, "the free tools must still be there"
+
+
+async def test_the_execution_tool_is_published_with_the_qa_flag() -> None:
+    async with one_server(qa_topup=True) as (url, _), mcp_client(url) as client:
+        tools = await client.list_tools()
+        named = {tool.name: tool for tool in tools.tools}
+
+    assert "confirm_esim_topup" in named
+    annotations = named["confirm_esim_topup"].annotations
+    assert annotations.destructive_hint is True
+    assert annotations.idempotent_hint is False
+
+
+async def test_two_users_top_up_their_own_esims_and_never_each_others() -> None:
+    async with (
+        one_server(qa_topup=True) as (url, backend),
+        mcp_client(url) as client_a,
+        mcp_client(url) as client_b,
+    ):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+
+        result_a = await confirm_own_topup(client_a)
+        result_b = await confirm_own_topup(client_b)
+
+        assert result_a["topped_up"] is True
+        assert result_b["topped_up"] is True
+        assert result_a["order_id"] == "ord-topup-alice"
+        assert result_b["order_id"] == "ord-topup-bob"
+        # One top-up each, and neither reached the other's SIM.
+        assert sorted(backend.topups) == ["alice@example.com", "bob@example.com"]
+
+
+async def test_one_user_cannot_confirm_another_users_prepared_top_up() -> None:
+    async with (
+        one_server(qa_topup=True) as (url, backend),
+        mcp_client(url) as client_a,
+        mcp_client(url) as client_b,
+    ):
+        await sign_in(client_a, "alice@example.com")
+        await sign_in(client_b, "bob@example.com")
+
+        quote = await call(client_a, "prepare_esim_topup", bundle_code=TOPUP_BUNDLE)
+        stolen = await call(
+            client_b,
+            "confirm_esim_topup",
+            quote_id=quote["quote_id"],
+            confirmed_amount=quote["confirm_amount"],
+        )
+
+        assert isinstance(stolen, str)
+        assert "topup_quote_not_found" in stolen
+        assert backend.topups == [], "one user's confirmation topped up for another"
+
+
+async def test_a_second_confirmation_never_reaches_the_platform_twice() -> None:
+    """The one-attempt lock, over the real transport."""
+    async with one_server(qa_topup=True) as (url, backend), mcp_client(url) as client:
+        await sign_in(client, "alice@example.com")
+
+        quote = await call(client, "prepare_esim_topup", bundle_code=TOPUP_BUNDLE)
+        first = await call(
+            client, "confirm_esim_topup", quote_id=quote["quote_id"], confirmed_amount=quote["confirm_amount"]
+        )
+        second = await call(
+            client, "confirm_esim_topup", quote_id=quote["quote_id"], confirmed_amount=quote["confirm_amount"]
+        )
+
+        assert first["topped_up"] is True
+        assert second["replayed"] is True
+        assert backend.topups == ["alice@example.com"], "the platform ran the top-up twice"
+
+
+async def test_a_reconnecting_client_cannot_confirm_a_top_up_prepared_before() -> None:
+    """Reconnect fails closed for the money path too."""
+    async with one_server(qa_topup=True) as (url, backend):
+        async with mcp_client(url) as first:
+            await sign_in(first, "alice@example.com")
+            quote = await call(first, "prepare_esim_topup", bundle_code=TOPUP_BUNDLE)
+
+        async with mcp_client(url) as reconnected:
+            result = await call(
+                reconnected,
+                "confirm_esim_topup",
+                quote_id=quote["quote_id"],
+                confirmed_amount=quote["confirm_amount"],
+            )
+
+        assert isinstance(result, str)
+        assert "authentication_required" in result
+        assert backend.topups == [], "a reconnect executed a top-up"
+
+
+async def test_five_concurrent_users_each_top_up_exactly_their_own_esim_once() -> None:
+    """Five real connections, five accounts, all confirmations interleaved.
+
+    Each account has its own ICCID and its own order reference, so a crossed session shows
+    up as the wrong order id -- and the stub's per-account tally shows up any double charge.
+    """
+    emails = list(ACCOUNTS)
+    async with (
+        one_server(qa_topup=True) as (url, backend), mcp_client(url) as c1,
+        mcp_client(url) as c2,
+        mcp_client(url) as c3,
+        mcp_client(url) as c4,
+        mcp_client(url) as c5,
+    ):
+        clients = [c1, c2, c3, c4, c5]
+        await asyncio.gather(*(sign_in(client, email) for client, email in zip(clients, emails, strict=True)))
+
+        results = await asyncio.gather(*(confirm_own_topup(client) for client in clients))
+
+        for email, result in zip(emails, results, strict=True):
+            assert isinstance(result, dict), result
+            assert result["topped_up"] is True
+            assert result["order_id"] == ACCOUNTS[email]["topup_order"]
+
+        # Exactly one top-up per account, and no account appears twice.
+        assert sorted(backend.topups) == sorted(emails)
+        assert len(set(backend.topups)) == 5
+        assert len(set(backend.phase_six_device_ids)) == 5

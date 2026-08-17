@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "AccountReadTimeoutError",
     "AmbiguousCountryError",
     "AmbiguousRegionError",
     "AuthenticationRequiredError",
@@ -26,8 +27,19 @@ __all__ = [
     "CardPaymentNotFoundError",
     "CardPaymentStatusUnavailableError",
     "CatalogUnavailableError",
+    "ConsumptionUnavailableError",
     "CountryNotFoundError",
     "EsimMcpError",
+    "EsimNotFoundError",
+    "EsimSelectionOutOfRangeError",
+    "EsimSelectionUnavailableError",
+    "EsimTopupAlreadyAttemptedError",
+    "EsimTopupConfirmationRequiredError",
+    "EsimTopupExecutionUnavailableError",
+    "EsimTopupNotSupportedError",
+    "EsimTopupOptionsUnavailableError",
+    "EsimTopupOutcomeUnknownError",
+    "EsimTopupRejectedError",
     "ExpiredOtpError",
     "ForbiddenBackendRouteError",
     "IdempotencyConflictError",
@@ -37,7 +49,10 @@ __all__ = [
     "InvalidBackendResponseError",
     "InvalidInputError",
     "InvalidOtpError",
+    "NoConsumptionDataError",
     "NoMatchingBundlesError",
+    "NoPurchasedEsimsError",
+    "NoTopupOptionsError",
     "NonCardQuoteError",
     "NonWalletQuoteError",
     "OtpLimitReachedError",
@@ -59,8 +74,20 @@ __all__ = [
     "RateLimitedError",
     "RegionNotFoundError",
     "TooManyActiveQuotesError",
+    "TopupBundleIncompatibleError",
+    "TopupQuoteCancelledError",
+    "TopupQuoteExpiredError",
+    "TopupQuoteNotFoundError",
     "UnsafeCheckoutLinkError",
     "UnsupportedPaymentMethodError",
+    "WalletTopupAmountInvalidError",
+    "WalletTopupLimitReachedError",
+    "WalletTopupNotFoundError",
+    "WalletTopupOutcomeUnknownError",
+    "WalletTopupQuoteNotFoundError",
+    "WalletTopupRejectedError",
+    "WalletTopupStatusUnavailableError",
+    "WalletTopupUnavailableError",
     "WalletUnavailableError",
 ]
 
@@ -152,6 +179,31 @@ class BackendUnavailableError(EsimMcpError):
 class BackendTimeoutError(EsimMcpError):
     code = "backend_timeout"
     default_message = "The eSIM backend did not respond in time."
+    retryable = True
+
+
+class AccountReadTimeoutError(BackendTimeoutError):
+    """One of the two account-history reads ran past its own read budget.
+
+    A subclass of :class:`BackendTimeoutError` so every existing handler still catches it,
+    and a distinct type so the one thing that must never happen to this failure -- being
+    reported as an empty account -- can be ruled out in words the model actually receives.
+
+    The message is deliberately an instruction not to retry. Nothing was created and nothing
+    was charged, so a repeat is *safe*; it is simply useless. The platform is still building
+    the same answer, and a second attempt at this budget only doubles the silence the user
+    sits through before hearing anything at all. The user asks again when they want to.
+    """
+
+    code = "account_read_timeout"
+    default_message = (
+        "The eSIM platform did not finish reading this account in time, so nothing could be read. "
+        "This is a slow platform, NOT an empty account: never tell the user they have no eSIMs, no "
+        "plans and no orders on the strength of this, and never say an eSIM they bought is missing. "
+        "Do NOT call the tool again by yourself -- trying again straight away only makes the user "
+        "wait twice. Tell them the platform is being slow right now and that they can ask again in a "
+        "few minutes."
+    )
     retryable = True
 
 
@@ -535,6 +587,334 @@ class CardPaymentCheckLimitError(EsimMcpError):
         "checking it. Tell the user the platform has not settled it yet and that they should check their eSIM "
         "app or contact eSIM support."
     )
+
+
+# ---------------------------------------------------------------- purchased eSIM reads
+#
+# Phase 6A errors, raised by ``get_esim_consumption`` and by the top-up option read. None of
+# them can be raised after a charge, because neither tool can charge: both are reads.
+
+
+class NoPurchasedEsimsError(EsimMcpError):
+    code = "no_purchased_esims"
+    default_message = (
+        "This account owns no eSIMs, so there is nothing to report usage for. Tell the user plainly that they "
+        "have no eSIMs on this account yet, and offer to help them choose a plan. Never invent an eSIM."
+    )
+
+
+class EsimNotFoundError(EsimMcpError):
+    """Also returned for an eSIM belonging to somebody else -- ownership is invisible.
+
+    A caller must not be able to learn that an ICCID exists by being told "that is not
+    yours", so an unknown ICCID and another user's ICCID give the identical answer.
+    """
+
+    code = "esim_not_found"
+    default_message = (
+        "No eSIM with that identifier is on this account. Use get_my_esims to see the eSIMs the signed-in user "
+        "actually owns, and pick from those -- never invent an identifier and never take one from the user."
+    )
+
+
+class EsimSelectionUnavailableError(EsimMcpError):
+    """A number was given, but this client-and-user has no numbered listing to resolve it in.
+
+    Reached whenever the mapping from "number 2" to an ICCID cannot be trusted: nothing has
+    been listed yet, the session was signed out or replaced, the client reconnected onto a
+    fresh session, the server restarted, or the same client is now signed in as somebody else.
+    Every one of those has the same honest answer -- list the eSIMs again -- because a number
+    without the listing it came from does not identify anything.
+
+    Deliberately *not* an invalid-input error. The caller did nothing wrong; the context it
+    was relying on is gone, and the fix is a tool call rather than a corrected argument.
+    """
+
+    code = "esim_selection_unavailable"
+    default_message = (
+        "There is no current list of this user's eSIMs to resolve that number against, so it is not clear which "
+        "eSIM was meant. This usually means nothing has been listed yet in this session, or the user signed out, "
+        "signed in again, or reconnected since the last list. Call get_my_esims to show the numbered list again, "
+        "then use a number from THAT list. Never guess which eSIM was meant and never carry a number over from an "
+        "earlier list."
+    )
+
+
+class EsimSelectionOutOfRangeError(InvalidInputError):
+    """The number is not one of the numbers in the caller's current listing.
+
+    A subclass of :class:`InvalidInputError` because that is what it is -- a bad argument,
+    caught before any backend call -- while still carrying its own code so the caller can tell
+    "you picked 9 of 3" apart from every other rejected argument.
+    """
+
+    code = "esim_selection_out_of_range"
+    default_message = (
+        "That number is not on the current list of this user's eSIMs. Show the numbered list again and ask the "
+        "user which one they mean, then use a number from that list. Never guess."
+    )
+
+
+class NoConsumptionDataError(EsimMcpError):
+    """The platform answered, and had nothing to report. Not an error, and not zero usage."""
+
+    code = "no_consumption_data"
+    default_message = (
+        "The platform has no usage figures for this eSIM yet. That usually means the plan has not started. Tell "
+        "the user no usage has been reported yet -- never say they have used nothing, never say they have their "
+        "full allowance left, and never work a figure out from a date."
+    )
+
+
+class ConsumptionUnavailableError(EsimMcpError):
+    code = "consumption_unavailable"
+    default_message = (
+        "The eSIM platform could not report usage for this eSIM just now. Tell the user the figures could not be "
+        "read and offer to check again shortly. Never guess how much data is left."
+    )
+    retryable = True
+
+
+# ------------------------------------------------------------------------ eSIM top-up
+#
+# Phase 6B errors. The read and the preparation cannot charge; the execution tool that could
+# is deliberately not implemented -- see :class:`EsimTopupExecutionUnavailableError`.
+
+
+class EsimTopupNotSupportedError(EsimMcpError):
+    code = "esim_topup_not_supported"
+    default_message = (
+        "The platform does not allow this eSIM to be topped up. Tell the user plainly and offer to look at a new "
+        "plan for their destination instead."
+    )
+
+
+class NoTopupOptionsError(EsimMcpError):
+    code = "no_topup_options"
+    default_message = (
+        "The platform offers no top-up plans for this eSIM. Say so plainly -- never offer a plan from the general "
+        "catalogue as a top-up, because only the platform can say what is compatible with a SIM already in use."
+    )
+
+
+class EsimTopupOptionsUnavailableError(EsimMcpError):
+    code = "esim_topup_options_unavailable"
+    default_message = (
+        "The eSIM platform could not list top-up plans for this eSIM just now. Tell the user and offer to try "
+        "again shortly. Never present catalogue plans as if they were compatible top-ups."
+    )
+    retryable = True
+
+
+class TopupBundleIncompatibleError(EsimMcpError):
+    code = "topup_bundle_incompatible"
+    default_message = (
+        "That plan is not one the platform offers as a top-up for this eSIM. Use get_esim_topup_options and pick "
+        "a plan from what it returns -- never a bundle_code from the general catalogue."
+    )
+
+
+class TopupQuoteNotFoundError(EsimMcpError):
+    """Also returned for a quote owned by somebody else -- ownership is invisible."""
+
+    code = "topup_quote_not_found"
+    default_message = (
+        "No prepared top-up with that reference exists for this client. Prepare the top-up again before referring "
+        "to it."
+    )
+
+
+class TopupQuoteExpiredError(EsimMcpError):
+    code = "topup_quote_expired"
+    default_message = (
+        "That prepared top-up has expired, so its price is no longer current. Prepare it again if the user still "
+        "wants it. Nothing was ordered and nothing was charged."
+    )
+
+
+class TopupQuoteCancelledError(EsimMcpError):
+    code = "topup_quote_cancelled"
+    default_message = (
+        "That prepared top-up was already cancelled. Prepare it again if the user still wants it. Nothing was "
+        "ordered and nothing was charged."
+    )
+
+
+class EsimTopupExecutionUnavailableError(EsimMcpError):
+    """Executing an eSIM top-up is switched off on this deployment.
+
+    The platform's own top-up endpoint takes no idempotency key and keeps no record that a
+    retry could be recognized from: a ``Topup`` order row carries no ICCID column and no
+    request key, so two identical requests are indistinguishable from one request sent
+    twice. Making a retry safe would need a durable key, which needs a schema change.
+
+    Because of that the capability is behind a QA-only flag which defaults to off and which
+    production settings refuse to construct. This error is what a caller gets when the flag
+    is off: the tool is not registered at all in that state, so reaching this is either a
+    direct service call or a deployment that turned the flag off mid-session.
+    """
+
+    code = "esim_topup_execution_unavailable"
+    default_message = (
+        "This assistant cannot carry out an eSIM top-up on this deployment: the platform cannot guarantee that a "
+        "repeated request would not top the SIM up twice, so the step is switched off rather than risked. Tell "
+        "the user the top-up has to be completed in the eSIM app or on the website, and give them the plan and "
+        "the amount they were quoted so they can find it. Nothing was ordered and nothing was charged."
+    )
+
+
+class EsimTopupConfirmationRequiredError(EsimMcpError):
+    """The final confirmation did not match the quote the user was shown."""
+
+    code = "esim_topup_confirmation_required"
+    default_message = (
+        "This top-up was not carried out because the confirmation did not match the prepared quote. Read the "
+        "eSIM, the plan and the exact amount back to the user from the prepared quote, get their explicit "
+        "agreement to that amount, and confirm again with the amount exactly as the quote states it. Nothing "
+        "was ordered and nothing was charged."
+    )
+
+
+class EsimTopupRejectedError(EsimMcpError):
+    """The platform refused the top-up before executing it. Nothing was charged."""
+
+    code = "esim_topup_rejected"
+    default_message = (
+        "The eSIM platform rejected this top-up and nothing was charged. Tell the user it did not go through "
+        "and offer to prepare it again."
+    )
+
+
+class EsimTopupOutcomeUnknownError(EsimMcpError):
+    """The platform never gave a usable answer, so the outcome is genuinely unknown.
+
+    Terminal here in a way it is not for any other flow in this codebase. The wallet
+    purchase and the two hosted checkouts may all be asked again with the key they already
+    used; this route has no key, so asking again is a *second top-up*, not a question about
+    the first. The quote is locked and never re-sent.
+    """
+
+    code = "esim_topup_outcome_unknown"
+    default_message = (
+        "The eSIM platform did not confirm the outcome of this top-up, so it may or may not have gone through "
+        "and the wallet may or may not have been charged. Never say it succeeded and never say it failed. Do "
+        "NOT try again and do NOT prepare another top-up for the same plan -- this step cannot be repeated "
+        "safely, so a second attempt could charge the user twice. Tell the user to check their eSIMs, their "
+        "data usage, their wallet balance or their order history to see whether it went through, and to contact "
+        "eSIM support if it is still unclear."
+    )
+
+
+class EsimTopupAlreadyAttemptedError(EsimMcpError):
+    """This quote has already been sent for execution. It may never be sent again.
+
+    The lock that makes a non-idempotent write survivable: one quote, one attempt, whatever
+    the outcome was. A caller that wants to try again has to prepare a fresh quote, which is
+    a deliberate act rather than a retry.
+    """
+
+    code = "esim_topup_already_attempted"
+    default_message = (
+        "This top-up has already been sent to the eSIM platform once and cannot be sent again -- repeating it "
+        "could charge the user twice. Tell the user to check their eSIMs, their data usage, their wallet "
+        "balance or their order history to see what happened, and never confirm this top-up again."
+    )
+
+
+# ------------------------------------------------------------------------ wallet top-up
+#
+# Phase 6C errors, raised by the wallet top-up tools only.
+#
+# The money model matches the card checkout, not the wallet purchase: **opening a top-up
+# page never charges anybody**, because the card is entered on the payment provider's own
+# hosted page. So a failure to open one is safe to describe as a failure. What is never safe
+# is to describe a top-up as received or a balance as credited -- only the platform's own
+# signature-verified webhook can make either true, and these tools only ever read the result.
+
+
+class WalletTopupAmountInvalidError(EsimMcpError):
+    code = "wallet_topup_amount_invalid"
+    default_message = (
+        "The platform will not accept that top-up amount. Tell the user the amount the platform does accept, ask "
+        "them for a new one, and prepare it again. Nothing was charged."
+    )
+
+
+class WalletTopupLimitReachedError(EsimMcpError):
+    code = "wallet_topup_limit_reached"
+    default_message = (
+        "The platform's own top-up limit for this account has been reached, so no payment page was opened and "
+        "nothing was charged. Tell the user plainly and say the limit resets after a day. Never try a smaller "
+        "amount on your own initiative."
+    )
+
+
+class WalletTopupUnavailableError(EsimMcpError):
+    """Wallet top-up is switched off, or the platform does not offer the route."""
+
+    code = "wallet_topup_unavailable"
+    default_message = (
+        "Adding money to the wallet is currently unavailable at the eSIM platform, so no payment page was opened "
+        "and nothing was charged. Tell the user and offer to try again shortly."
+    )
+    retryable = True
+
+
+class WalletTopupRejectedError(EsimMcpError):
+    """The platform refused to open a top-up page. Nothing was charged."""
+
+    code = "wallet_topup_rejected"
+    default_message = (
+        "The eSIM platform would not open a payment page for this top-up, and nothing was charged. Tell the user "
+        "it did not start and offer to try a different amount."
+    )
+
+
+class WalletTopupOutcomeUnknownError(EsimMcpError):
+    """This server never learned whether a top-up page was created.
+
+    Deliberately *not* an instruction to stop. Creating a page moves no money, and the
+    platform recognizes a repeat of the same top-up from its own pending order row, so
+    asking again returns the page it already made rather than opening a second one.
+    """
+
+    code = "wallet_topup_outcome_unknown"
+    default_message = (
+        "The answer to the top-up request never arrived, so this server has no payment link to hand over. "
+        "Nothing has been charged and the wallet has not been credited -- a payment page is not a payment. This "
+        "is a lost answer, not a refusal. Tell the user the link did not come back this time and offer to try "
+        "the SAME prepared top-up again, which returns the same page rather than opening a second one."
+    )
+    retryable = True
+
+
+class WalletTopupQuoteNotFoundError(EsimMcpError):
+    """Also returned for a quote owned by somebody else -- ownership is invisible."""
+
+    code = "wallet_topup_quote_not_found"
+    default_message = (
+        "No prepared top-up with that reference exists for this client. Prepare the amount again with "
+        "prepare_wallet_topup and confirm it with the user before opening a payment page."
+    )
+
+
+class WalletTopupNotFoundError(EsimMcpError):
+    """Also returned for a top-up belonging to somebody else -- ownership is invisible."""
+
+    code = "wallet_topup_not_found"
+    default_message = (
+        "No wallet top-up with that reference was started by this client. Use the reference from your own "
+        "create_wallet_topup_checkout result, and never take one from the user or invent one."
+    )
+
+
+class WalletTopupStatusUnavailableError(EsimMcpError):
+    code = "wallet_topup_status_unavailable"
+    default_message = (
+        "The eSIM platform could not report the state of this top-up just now. Never guess whether it went "
+        "through: tell the user it could not be checked and offer to check the same top-up again shortly."
+    )
+    retryable = True
 
 
 class ForbiddenBackendRouteError(EsimMcpError):

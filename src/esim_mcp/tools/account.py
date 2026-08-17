@@ -54,10 +54,14 @@ from esim_mcp.models.account import (
     parse_esims,
     parse_order_history,
 )
+from esim_mcp.purchase.store import QuoteOwner
+from esim_mcp.selection.models import iccid_last4
+from esim_mcp.selection.service import EsimSelectionService
 from esim_mcp.session.identity import ClientIdentityProvider, derive_device_id
 from esim_mcp.session.manager import SessionManager
 from esim_mcp.settings import Settings
 from esim_mcp.tools.guard import guarded
+from esim_mcp.tools.purchase_preparation import user_ref_of
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +80,30 @@ CREDENTIAL_NOTE = (
 )
 
 #: What to do with an eSIM list.
+#:
+#: The numbering is not decoration. An ICCID is a credential-shaped identifier this server
+#: never reads out, so a user who owns several eSIMs has no way to say which one they mean
+#: unless the list gives them one. ``number`` is that handle, and the follow-up tools take it
+#: directly -- which is why the instruction to show it is as firm as the instruction not to
+#: show the identifier.
 ESIM_NEXT_STEP = (
-    "Describe the user's eSIMs in ordinary language: the plan name, the data, the validity and whether each one "
-    "has started or expired. Do not read the ICCID or the bundle code out unless the user asks for them. Give the "
-    "install details only when the user wants to install a SIM, and say plainly that this assistant cannot do the "
-    "installing. Never claim an eSIM is active, connected or using data: nothing here reports that."
+    "Show the user their eSIMs as a NUMBERED list, using the 'number' on each entry exactly as it is given -- 1, "
+    "2, 3 and so on. For each one give: the number, the plan name, the data allowance, the validity, the status, "
+    "the purchase date, and the last four digits of the identifier from 'iccid_last4' (write them as ****1234). "
+    "Show NOTHING else of the identifier: the full ICCID is in the result so that follow-up tools can use it, and "
+    "it must never appear in your reply unless the user explicitly asks you for the full number. Do not read the "
+    "bundle code out either. Give the install details only when the user wants to install a SIM, and say plainly "
+    "that this assistant cannot do the installing. Never claim an eSIM is active, connected or using data: "
+    "nothing here reports that."
+)
+
+#: How a number the user gives back is meant to be used.
+ESIM_SELECTION_NOTE = (
+    "These numbers are how the user picks an eSIM. If they then say something like 'number 2', pass esim_number=2 "
+    "to get_esim_consumption or get_esim_topup_options -- do not pass an identifier and do not call get_my_esims "
+    "again first. The numbers belong to THIS list only: if the user signs out, signs in as someone else or "
+    "reconnects, call get_my_esims again and use the numbers from the new list. Never carry a number over from an "
+    "earlier list and never guess which eSIM was meant."
 )
 
 #: The one thing an eSIM list cannot answer, stated so it is not guessed at.
@@ -148,11 +171,13 @@ class AccountService:
         account_client: AccountApiClient,
         session_manager: SessionManager,
         identity_provider: ClientIdentityProvider,
+        selection_service: EsimSelectionService,
     ) -> None:
         self._settings = settings
         self._accounts = account_client
         self._sessions = session_manager
         self._identity_provider = identity_provider
+        self._selection = selection_service
 
     # ------------------------------------------------------------------ internals
 
@@ -186,6 +211,12 @@ class AccountService:
         identity, device_id = await self._caller(ctx)
         locale_value = self._locale(locale)
         currency_value = self._currency(currency)
+        # Resolved before the read so the listing can be recorded against the *authenticated
+        # user*, not merely against the MCP client. Both halves are needed: without the user
+        # reference, a number recorded here would go on resolving after the same client
+        # signed in as somebody else.
+        session = await self._sessions.require_session(identity.session_key)
+        owner = QuoteOwner(session_key=identity.session_key, user_ref=user_ref_of(session))
 
         async def operation(access_token: Any) -> Any:
             return await self._accounts.get_my_esims(
@@ -207,6 +238,13 @@ class AccountService:
         )
 
         esims = parse_esims(data)
+        # Recorded before the result is shaped, and from the same list in the same order, so
+        # the number the user is shown and the number a follow-up call resolves cannot
+        # disagree. Recording an empty list is deliberate: it replaces whatever this owner
+        # had before, so a number from a previous account's listing stops resolving here
+        # rather than at the next successful read.
+        entries = await self._selection.record(owner, esims)
+        numbers = {entry.iccid: entry.number for entry in entries}
         logger.info("my_esims_read", extra={"esim_count": len(esims)})
 
         if not esims:
@@ -225,10 +263,11 @@ class AccountService:
         return {
             "status": "ok",
             "total_count": len(esims),
-            "esims": [_esim_result(esim) for esim in esims],
+            "esims": [_esim_result(esim, number=numbers.get(esim.iccid or "")) for esim in esims],
             "install_note": INSTALL_NOTE,
             "credential_note": CREDENTIAL_NOTE,
             "consumption_note": NO_CONSUMPTION_NOTE,
+            "selection_note": ESIM_SELECTION_NOTE,
             "next_step": ESIM_NEXT_STEP,
         }
 
@@ -308,12 +347,19 @@ def _prune(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None and value != ""}
 
 
-def _esim_result(esim: BackendEsim) -> dict[str, Any]:
+def _esim_result(esim: BackendEsim, *, number: int | None = None) -> dict[str, Any]:
     """One eSIM, carrying only what the backend actually reported.
 
     ``plan_started`` and ``bundle_expired`` are the platform's own words and are kept
     separate: a plan that has not started is not the same as one that has expired, and
     collapsing them would tell a user their SIM is dead when it is merely unused.
+
+    ``number`` is this eSIM's position in the list the user is about to be shown, and
+    ``iccid_last4`` is the only part of the identifier that may appear in a reply. The full
+    ``iccid`` stays in the payload because the follow-up tools and the model's own bookkeeping
+    need it; the guidance, not this function, is what keeps it off the screen. An eSIM the
+    platform sent without an identifier gets neither key -- it cannot be selected, and a
+    number that resolves to nothing would be worse than no number at all.
     """
     plan = _prune(
         {
@@ -338,7 +384,9 @@ def _esim_result(esim: BackendEsim) -> dict[str, Any]:
     )
     result = _prune(
         {
+            "number": number,
             "iccid": esim.iccid,
+            "iccid_last4": iccid_last4(esim.iccid),
             "label": esim.label_name,
             "order_reference": esim.order_number,
             "order_status": esim.order_status,
@@ -442,14 +490,26 @@ def register_account_tools(server: MCPServer, service: AccountService) -> None:
             "login conversation if they are not.\n"
             "This is about plans the user ALREADY OWNS. To show plans the platform SELLS, use "
             "find_bundles_by_country or the other catalogue tools instead.\n"
-            "AFTER SUCCESS: describe the eSIMs in ordinary language -- plan name, data, "
-            "validity, and whether each has started or expired. Do not read an ICCID or a "
-            "bundle code out unless the user asks. Give the SM-DP+ address, activation code "
-            "and QR value only when the user wants to install one, and tell them plainly that "
-            "you cannot install or activate it for them.\n"
+            "AFTER SUCCESS: show the eSIMs as a NUMBERED list, using each entry's own "
+            "'number'. For every eSIM give the number, the plan name, the data allowance, the "
+            "validity, the status and the purchase date, and identify it ONLY by the last four "
+            "digits from 'iccid_last4' (written as ****1234). The full ICCID is in the result "
+            "for the follow-up tools to use -- never put it in a reply unless the user "
+            "explicitly asks for the full number, and never read a bundle code out. Give the "
+            "SM-DP+ address, activation code and QR value only when the user wants to install "
+            "one, and tell them plainly that you cannot install or activate it for them.\n"
+            "PICKING ONE AFTERWARDS: those numbers are how the user chooses. When they say "
+            "'number 2', pass esim_number=2 to get_esim_consumption or "
+            "get_esim_topup_options -- do not pass an identifier, and do not call this tool "
+            "again first. The numbers belong to this list only: after a sign-out, a sign-in as "
+            "a different user or a reconnect, call this again and use the new numbers.\n"
             "THIS DOES NOT REPORT DATA USAGE. The platform sends no used or remaining figure "
             "here, so never tell the user how much data is left and never work it out from a "
-            "date. If the account has no eSIMs, say so plainly and never invent one."
+            "date. If the account has no eSIMs, say so plainly and never invent one.\n"
+            "IF THIS ANSWERS 'account_read_timeout': the platform was too slow to answer, and "
+            "that is NOT an empty account. Never say the user has no eSIMs, and never say an "
+            "eSIM they bought has gone missing. Do not call this tool again by yourself -- tell "
+            "the user the platform is slow right now and let them ask again."
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
     )
@@ -479,7 +539,11 @@ def register_account_tools(server: MCPServer, service: AccountService) -> None:
             "for one. If the account has no orders, say so plainly and never invent one.\n"
             "This shows ORDERS, not eSIMs. If the user wants the eSIM itself, its status or "
             "how to install it, use get_my_esims instead. Nothing here can be cancelled or "
-            "refunded from this assistant, so never offer either."
+            "refunded from this assistant, so never offer either.\n"
+            "IF THIS ANSWERS 'account_read_timeout': the platform was too slow to answer, and "
+            "that is NOT an account without orders. Never say the user has never bought "
+            "anything. Do not call this tool again by yourself -- tell the user the platform is "
+            "slow right now and let them ask again."
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
     )
